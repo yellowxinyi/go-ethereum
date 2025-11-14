@@ -118,6 +118,15 @@ type Peer struct {
 	// events receives message send / receive events if set
 	events   *event.Feed
 	testPipe *MsgPipeRW // for testing
+	// --- 修改 ---
+	// 跟踪正在进行中的 liveness ping
+	pendingPingLock sync.Mutex
+	pendingPingTime time.Time // ping发出时间
+
+	// 跟踪统计数据
+	totalPingTime  time.Duration // totaltime
+	totalPingCount uint64        // count
+	// --- 修改 ---
 }
 
 // NewPeer returns a peer for testing purposes.
@@ -334,6 +343,19 @@ func (p *Peer) pingLoop() {
 	for {
 		select {
 		case <-ping.C:
+			// ---修改 ---
+			// 在发送 PingMsg (pingMsg) 之前，记录时间
+			p.pendingPingLock.Lock()
+			p.pendingPingTime = time.Now()
+			p.pendingPingLock.Unlock()
+
+			// ping的时间节点的IP
+			// (Geth 的日志会自动包含 peer IP)
+			p.log.Info("Sent liveness ping",
+				"addr", p.RemoteAddr().String(), //
+				"time", p.pendingPingTime,
+			)
+			// --- 修改 ---
 			if err := SendItems(p.rw, pingMsg); err != nil {
 				p.protoErr <- err
 				return
@@ -373,6 +395,36 @@ func (p *Peer) handle(msg Msg) error {
 		case p.pingRecv <- struct{}{}:
 		case <-p.closed:
 		}
+	// --- 修改 ---
+	case msg.Code == pongMsg: //
+		// 接受pong时间
+		receiveTime := time.Now()
+		msg.Discard()
+
+		p.pendingPingLock.Lock()
+		sendTime := p.pendingPingTime   // 发送时间
+		p.pendingPingTime = time.Time{} // 清空，表示这次 ping 已完成
+		p.pendingPingLock.Unlock()
+
+		// 如果 sendTime 不是零值
+		if !sendTime.IsZero() {
+			// 本次延迟
+			latency := receiveTime.Sub(sendTime)
+
+			// count
+			p.totalPingCount++
+			// 总时间
+			p.totalPingTime += latency
+
+			//记录
+			p.log.Info("Ping/Pong Liveness Stats",
+				"addr", p.RemoteAddr().String(), // IP
+				"Total_Time_So_Far", p.totalPingTime, // total time
+				"count", p.totalPingCount, // total count
+				"Total", latency, // Total (本次ping往返的时间)
+			)
+		}
+	// --- 修改 ---
 	case msg.Code == discMsg:
 		// This is the last message. We don't need to discard or
 		// check errors because, the connection will be closed after it.

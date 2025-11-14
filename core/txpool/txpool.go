@@ -17,10 +17,20 @@
 package txpool
 
 import (
+	"bufio" // 用于高效文件写入
 	"errors"
 	"fmt"
 	"math/big"
+	"os"            // 用于创建文件和目录
+	"path/filepath" // 用于安全地加入文件路径
 	"sync"
+	"time"
+
+	// === LEVELDB MODIFICATION START ===
+	"github.com/syndtr/goleveldb/leveldb"
+	"github.com/syndtr/goleveldb/leveldb/opt"
+
+	// === LEVELDB MODIFICATION END ===
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core"
@@ -40,6 +50,16 @@ const (
 	TxStatusPending
 	TxStatusIncluded
 )
+
+// txPoolObservation 是一个数据结构，用于在通道中异步传递
+// 交易池快照，以便进行I/O操作。
+type txPoolObservation struct {
+	timestamp   time.Time
+	blockHash   common.Hash
+	blockNumber uint64
+	runnable    map[common.Address][]*types.Transaction
+	blocked     map[common.Address][]*types.Transaction
+}
 
 // BlockChain defines the minimal set of methods needed to back a tx pool with
 // a chain. Exists to allow mocking the live chain out of tests.
@@ -74,6 +94,11 @@ type TxPool struct {
 	term chan struct{}           // Termination channel to detect a closed pool
 
 	sync chan chan error // Testing / simulator channel to block until internal reset is done
+
+	// === LEVELDB MODIFICATION START ===
+	observationChan chan *txPoolObservation // 用于异步观测的 Channel
+	db              *leveldb.DB             // KV 数据库实例 (使用 LevelDB)
+	// === LEVELDB MODIFICATION END ===
 }
 
 // New creates a new transaction pool to gather, sort and filter inbound
@@ -84,6 +109,27 @@ func New(gasTip uint64, chain BlockChain, subpools []SubPool) (*TxPool, error) {
 	// during initialization.
 	head := chain.CurrentBlock()
 
+	// === LEVELDB MODIFICATION START ===
+	// 定义和创建观测存储路径
+	const (
+		kvPath   = "/dev/mnt/eth-ob/kvdb"
+		textPath = "/dev/mnt/eth-ob/textfiles"
+	)
+	if err := os.MkdirAll(kvPath, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create kv path: %w", err)
+	}
+	if err := os.MkdirAll(textPath, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create text path: %w", err)
+	}
+
+	// 打开 LevelDB
+	// 使用默认选项 (nil)
+	db, err := leveldb.OpenFile(kvPath, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open leveldb: %w", err)
+	}
+	// === LEVELDB MODIFICATION END ===
+
 	// Initialize the state with head block, or fallback to empty one in
 	// case the head state is not available (might occur when node is not
 	// fully synced).
@@ -92,6 +138,9 @@ func New(gasTip uint64, chain BlockChain, subpools []SubPool) (*TxPool, error) {
 		statedb, err = chain.StateAt(types.EmptyRootHash)
 	}
 	if err != nil {
+		// === LEVELDB MODIFICATION START ===
+		db.Close() // 确保在出错时关闭数据库
+		// === LEVELDB MODIFICATION END ===
 		return nil, err
 	}
 	pool := &TxPool{
@@ -101,6 +150,12 @@ func New(gasTip uint64, chain BlockChain, subpools []SubPool) (*TxPool, error) {
 		quit:     make(chan chan error),
 		term:     make(chan struct{}),
 		sync:     make(chan chan error),
+
+		// === LEVELDB MODIFICATION START ===
+		// 使用 64 的缓冲区大小，以平衡内存和I/O抖动
+		observationChan: make(chan *txPoolObservation, 64),
+		db:              db,
+		// === LEVELDB MODIFICATION END ===
 	}
 	reserver := NewReservationTracker()
 	for i, subpool := range subpools {
@@ -108,12 +163,113 @@ func New(gasTip uint64, chain BlockChain, subpools []SubPool) (*TxPool, error) {
 			for j := i - 1; j >= 0; j-- {
 				subpools[j].Close()
 			}
+			// === LEVELDB MODIFICATION START ===
+			db.Close() // 出错时关闭数据库
+			// === LEVELDB MODIFICATION END ===
 			return nil, err
 		}
 	}
+	// === LEVELDB MODIFICATION START ===
+	go pool.observationWorker(textPath) // 启动“消费者” Goroutine
+	// === LEVELDB MODIFICATION END ===
 	go pool.loop(head)
 	return pool, nil
 }
+
+// === LEVELDB MODIFICATION START ===
+
+// observationWorker 是 txpool 的“消费者”goroutine。
+// 它从 observationChan 中读取交易池快照，并执行慢速的 I/O 操作
+// (写入文件和数据库)，而不会阻塞 txpool 的主循环。
+func (p *TxPool) observationWorker(textPath string) {
+	// 为 LevelDB 定义写入选项，关闭同步以获得最高性能
+	writeOptions := &opt.WriteOptions{
+		Sync: false,
+	}
+	// 循环从 channel 中读取数据，直到 p.Close() 关闭该 channel
+	for data := range p.observationChan {
+
+		blockNum := data.blockNumber
+		blockHashHex := data.blockHash.Hex()
+		timestampStr := data.timestamp.Format(time.RFC3339Nano)
+		log.Info("Observation worker processing snapshot", "block", blockHashHex, "num", blockNum)
+		// --- 1. KV 存储逻辑 (LevelDB 批量写入) ---
+		// 关键：创建一个新的批量写入 (Batch)
+		batch := new(leveldb.Batch)
+		txCount := 0
+		recordToKV := func(tx *types.Transaction) {
+			txHashBytes := tx.Hash().Bytes()
+			// 需求：[txhash, txRLP]
+			txRlp, err := tx.MarshalBinary() // MarshalBinary 即 RLP 编码
+			if err != nil {
+				log.Error("Failed to RLP encode tx for KV", "txHash", tx.Hash().Hex(), "err", err)
+				return // 跳过这个损坏的 tx
+			}
+			// 添加到 Batch (非常快，在内存中)
+			// LevelDB 的 Batch.Put 没有 error 返回
+			batch.Put(txHashBytes, txRlp)
+			txCount++
+		}
+		for _, txs := range data.runnable {
+			for _, tx := range txs {
+				recordToKV(tx)
+			}
+		}
+		for _, txs := range data.blocked {
+			for _, tx := range txs {
+				recordToKV(tx)
+			}
+		}
+		// 关键：一次性提交整个 Batch 到磁盘
+		// 使用 writeOptions (Sync: false)
+		if err := p.db.Write(batch, writeOptions); err != nil {
+			log.Error("Failed to apply KV batch", "block", blockHashHex, "err", err)
+		}
+		// --- 2. 文本文件逻辑 (bufio.Writer) ---
+		fileName := fmt.Sprintf("%d-%s.txt", blockNum, blockHashHex)
+		filePath := filepath.Join(textPath, fileName)
+
+		file, err := os.Create(filePath)
+		if err != nil {
+			log.Error("Failed to create observation file", "path", filePath, "err", err)
+			continue // KV 写入已完成，继续下一次循环
+		}
+
+		// 关键：使用 bufio.Writer 进行高速缓冲写入
+		writer := bufio.NewWriter(file)
+		// --- 将时间戳写入文件顶部 ---
+		writer.WriteString(fmt.Sprintf("ObservationTimestamp: %s\n", timestampStr)) // <--- 添加此行
+		writer.WriteString("---\n")                                                 // <--- 添加此行 (分隔符)
+
+		recordHashToFile := func(txHash common.Hash) {
+			// 需求：每行一个哈希
+			writer.WriteString(txHash.Hex() + "\n")
+		}
+
+		for _, txs := range data.runnable {
+			for _, tx := range txs {
+				recordHashToFile(tx.Hash())
+			}
+		}
+		for _, txs := range data.blocked {
+			for _, tx := range txs {
+				recordHashToFile(tx.Hash())
+			}
+		}
+
+		// 关键：将缓冲区内容一次性刷入磁盘
+		if err := writer.Flush(); err != nil {
+			log.Error("Failed to flush file writer", "path", filePath, "err", err)
+		}
+
+		// 关闭文件句柄
+		file.Close()
+
+		log.Info("Observation worker finished snapshot", "block", blockHashHex, "txCount", txCount)
+	}
+}
+
+// === LEVELDB MODIFICATION END ===
 
 // Close terminates the transaction pool and all its subpools.
 func (p *TxPool) Close() error {
@@ -125,6 +281,19 @@ func (p *TxPool) Close() error {
 	if err := <-errc; err != nil {
 		errs = append(errs, err)
 	}
+
+	// === LEVELDB MODIFICATION START ===
+	// 1. 关闭 observation channel
+	//    这将向 observationWorker 中的 'range' 循环发送信号，
+	//    使其在处理完所有剩余数据后退出。
+	close(p.observationChan)
+
+	// 2. 关闭数据库
+	if err := p.db.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("failed to close leveldb: %w", err))
+	}
+	// === LEVELDB MODIFICATION END ===
+
 	// Terminate each subpool
 	for _, subpool := range p.subpools {
 		if err := subpool.Close(); err != nil {
@@ -195,6 +364,31 @@ func (p *TxPool) loop(head *types.Header) {
 
 				// Busy marker injected, start a new subpool reset
 				go func(oldHead, newHead *types.Header) {
+					// === LEVELDB MODIFICATION START ===
+					// 1. 获取所有交易池内容 (Reset 之前)
+					runnable, blocked := p.Content()
+
+					// 2. 创建观测数据结构
+					data := &txPoolObservation{
+						timestamp:   time.Now(),
+						blockHash:   newHead.Hash(),
+						blockNumber: newHead.Number.Uint64(),
+						runnable:    runnable,
+						blocked:     blocked,
+					}
+
+					// 3. 将数据“扔”进 Channel (非阻塞)
+					//    如果 Channel 满了 (I/O 跟不上)，
+					//    会丢弃这次观测数据，以避免阻塞 txpool
+					select {
+					case p.observationChan <- data:
+						// 数据已发送
+					default:
+						// Channel 已满，I/O 太慢。
+						log.Warn("TxPool observation channel full, skipping snapshot", "block", newHead.Hash().Hex())
+					}
+					// === LEVELDB MODIFICATION END ===
+
 					for _, subpool := range p.subpools {
 						subpool.Reset(oldHead, newHead)
 					}
