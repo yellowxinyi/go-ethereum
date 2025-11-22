@@ -20,9 +20,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	stdlog "log" //add
 	"net"
+	"os" //add
+	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic" //add
 	"time"
 
 	"github.com/ethereum/go-ethereum/common/mclock"
@@ -118,15 +122,12 @@ type Peer struct {
 	// events receives message send / receive events if set
 	events   *event.Feed
 	testPipe *MsgPipeRW // for testing
-	// --- 修改 ---
-	// 跟踪正在进行中的 liveness ping
-	pendingPingLock sync.Mutex
-	pendingPingTime time.Time // ping发出时间
 
-	// 跟踪统计数据
-	totalPingTime  time.Duration // totaltime
-	totalPingCount uint64        // count
-	// --- 修改 ---
+	// add
+	lastPingSent   atomic.Int64
+	latencyLogger  *stdlog.Logger
+	latencyLogFile *os.File
+	//
 }
 
 // NewPeer returns a peer for testing purposes.
@@ -269,6 +270,33 @@ func newPeer(log log.Logger, conn *conn, protocols []Protocol) *Peer {
 		pingRecv: make(chan struct{}, 16),
 		log:      log.New("id", conn.node.ID(), "conn", conn.flags),
 	}
+	dirPath := "peerlatency"
+	if err := os.MkdirAll(dirPath, 0755); err != nil {
+		p.log.Warn("Failed to create latency log directory", "path", dirPath, "err", err)
+	} else {
+		fileName := fmt.Sprintf("%s.log", p.ID().String())
+		filePath := filepath.Join(dirPath, fileName)
+
+		_, err := os.Stat(filePath)
+
+		isNewFile := os.IsNotExist(err)
+
+		file, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			p.log.Warn("Failed to open latency log file", "path", filePath, "err", err)
+		} else {
+			if isNewFile {
+				header := fmt.Sprintf("LocalIP: %s\n", p.LocalAddr().String())
+				if _, err := file.WriteString(header); err != nil {
+					p.log.Warn("Failed to write latency log header", "path", filePath, "err", err)
+				}
+			}
+
+			p.latencyLogFile = file
+			p.latencyLogger = stdlog.New(file, "LATENCY: ", stdlog.LstdFlags|stdlog.Lmicroseconds)
+		}
+	}
+
 	return p
 }
 
@@ -330,6 +358,11 @@ loop:
 
 	close(p.closed)
 	p.rw.close(reason)
+	// close log file
+	if p.latencyLogFile != nil {
+		p.latencyLogFile.Close()
+	}
+	//
 	p.wg.Wait()
 	return remoteRequested, err
 }
@@ -343,19 +376,9 @@ func (p *Peer) pingLoop() {
 	for {
 		select {
 		case <-ping.C:
-			// ---修改 ---
-			// 在发送 PingMsg (pingMsg) 之前，记录时间
-			p.pendingPingLock.Lock()
-			p.pendingPingTime = time.Now()
-			p.pendingPingLock.Unlock()
-
-			// ping的时间节点的IP
-			// (Geth 的日志会自动包含 peer IP)
-			p.log.Info("Sent liveness ping",
-				"addr", p.RemoteAddr().String(), //
-				"time", p.pendingPingTime,
-			)
-			// --- 修改 ---
+			// add
+			p.lastPingSent.Store(time.Now().UnixNano())
+			//
 			if err := SendItems(p.rw, pingMsg); err != nil {
 				p.protoErr <- err
 				return
@@ -395,36 +418,21 @@ func (p *Peer) handle(msg Msg) error {
 		case p.pingRecv <- struct{}{}:
 		case <-p.closed:
 		}
-	// --- 修改 ---
-	case msg.Code == pongMsg: //
-		// 接受pong时间
-		receiveTime := time.Now()
+	case msg.Code == pongMsg:
 		msg.Discard()
+		lastPingNano := p.lastPingSent.Swap(0)
 
-		p.pendingPingLock.Lock()
-		sendTime := p.pendingPingTime   // 发送时间
-		p.pendingPingTime = time.Time{} // 清空，表示这次 ping 已完成
-		p.pendingPingLock.Unlock()
+		if lastPingNano != 0 {
 
-		// 如果 sendTime 不是零值
-		if !sendTime.IsZero() {
-			// 本次延迟
-			latency := receiveTime.Sub(sendTime)
+			lastPingTime := time.Unix(0, lastPingNano)
+			latency := time.Since(lastPingTime)
 
-			// count
-			p.totalPingCount++
-			// 总时间
-			p.totalPingTime += latency
-
-			//记录
-			p.log.Info("Ping/Pong Liveness Stats",
-				"addr", p.RemoteAddr().String(), // IP
-				"Total_Time_So_Far", p.totalPingTime, // total time
-				"count", p.totalPingCount, // total count
-				"Total", latency, // Total (本次ping往返的时间)
-			)
+			if p.latencyLogger != nil {
+				remoteAddr := p.RemoteAddr().String() //IP
+				p.latencyLogger.Printf("Peer %s, RemoteIP: %s, Latency: %v", p.ID(), remoteAddr, latency)
+			}
 		}
-	// --- 修改 ---
+		return nil
 	case msg.Code == discMsg:
 		// This is the last message. We don't need to discard or
 		// check errors because, the connection will be closed after it.
