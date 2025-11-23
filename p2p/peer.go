@@ -20,13 +20,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	stdlog "log" //add
 	"net"
-	"os" //add
-	"path/filepath"
 	"slices"
 	"sync"
-	"sync/atomic" //add
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common/mclock"
@@ -124,9 +121,8 @@ type Peer struct {
 	testPipe *MsgPipeRW // for testing
 
 	// add
-	lastPingSent   atomic.Int64
-	latencyLogger  *stdlog.Logger
-	latencyLogFile *os.File
+	lastPingSent  atomic.Pointer[time.Time]
+	latencyWriter io.Writer
 	//
 }
 
@@ -143,7 +139,7 @@ func NewPeer(id enode.ID, name string, caps []Cap) *Peer {
 	pipe, _ := net.Pipe()
 	node := enode.SignNull(new(enr.Record), id)
 	conn := &conn{fd: pipe, transport: nil, node: node, caps: caps, name: name}
-	peer := newPeer(log.Root(), conn, protos)
+	peer := newPeer(log.Root(), conn, protos, nil)
 	close(peer.closed) // ensures Disconnect doesn't block
 	return peer
 }
@@ -258,43 +254,18 @@ func (p *Peer) Lifetime() mclock.AbsTime {
 	return mclock.Now() - p.created
 }
 
-func newPeer(log log.Logger, conn *conn, protocols []Protocol) *Peer {
+func newPeer(log log.Logger, conn *conn, protocols []Protocol, latencyWriter io.Writer) *Peer {
 	protomap := matchProtocols(protocols, conn.caps, conn)
 	p := &Peer{
-		rw:       conn,
-		running:  protomap,
-		created:  mclock.Now(),
-		disc:     make(chan DiscReason),
-		protoErr: make(chan error, len(protomap)+1), // protocols + pingLoop
-		closed:   make(chan struct{}),
-		pingRecv: make(chan struct{}, 16),
-		log:      log.New("id", conn.node.ID(), "conn", conn.flags),
-	}
-	dirPath := "peerlatency"
-	if err := os.MkdirAll(dirPath, 0755); err != nil {
-		p.log.Warn("Failed to create latency log directory", "path", dirPath, "err", err)
-	} else {
-		fileName := fmt.Sprintf("%s.log", p.ID().String())
-		filePath := filepath.Join(dirPath, fileName)
-
-		_, err := os.Stat(filePath)
-
-		isNewFile := os.IsNotExist(err)
-
-		file, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
-			p.log.Warn("Failed to open latency log file", "path", filePath, "err", err)
-		} else {
-			if isNewFile {
-				header := fmt.Sprintf("LocalIP: %s\n", p.LocalAddr().String())
-				if _, err := file.WriteString(header); err != nil {
-					p.log.Warn("Failed to write latency log header", "path", filePath, "err", err)
-				}
-			}
-
-			p.latencyLogFile = file
-			p.latencyLogger = stdlog.New(file, "LATENCY: ", stdlog.LstdFlags|stdlog.Lmicroseconds)
-		}
+		rw:            conn,
+		running:       protomap,
+		created:       mclock.Now(),
+		disc:          make(chan DiscReason),
+		protoErr:      make(chan error, len(protomap)+1), // protocols + pingLoop
+		closed:        make(chan struct{}),
+		pingRecv:      make(chan struct{}, 16),
+		log:           log.New("id", conn.node.ID(), "conn", conn.flags),
+		latencyWriter: latencyWriter,
 	}
 
 	return p
@@ -358,11 +329,6 @@ loop:
 
 	close(p.closed)
 	p.rw.close(reason)
-	// close log file
-	if p.latencyLogFile != nil {
-		p.latencyLogFile.Close()
-	}
-	//
 	p.wg.Wait()
 	return remoteRequested, err
 }
@@ -377,7 +343,8 @@ func (p *Peer) pingLoop() {
 		select {
 		case <-ping.C:
 			// add
-			p.lastPingSent.Store(time.Now().UnixNano())
+			now := time.Now()
+			p.lastPingSent.Store(&now)
 			//
 			if err := SendItems(p.rw, pingMsg); err != nil {
 				p.protoErr <- err
@@ -419,20 +386,13 @@ func (p *Peer) handle(msg Msg) error {
 		case <-p.closed:
 		}
 	case msg.Code == pongMsg:
-		msg.Discard()
-		lastPingNano := p.lastPingSent.Swap(0)
-
-		if lastPingNano != 0 {
-
-			lastPingTime := time.Unix(0, lastPingNano)
-			latency := time.Since(lastPingTime)
-
-			if p.latencyLogger != nil {
-				remoteAddr := p.RemoteAddr().String() //IP
-				p.latencyLogger.Printf("Peer %s, RemoteIP: %s, Latency: %v", p.ID(), remoteAddr, latency)
+		if p.latencyWriter != nil {
+			latency := time.Since(*p.lastPingSent.Load())
+			if _, err := fmt.Fprintf(p.latencyWriter, "%s,%d\n", p.RemoteAddr(), latency.Nanoseconds()); err != nil {
+				return err
 			}
 		}
-		return nil
+		return msg.Discard()
 	case msg.Code == discMsg:
 		// This is the last message. We don't need to discard or
 		// check errors because, the connection will be closed after it.

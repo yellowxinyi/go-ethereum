@@ -77,8 +77,6 @@ require (
 	gopkg.in/yaml.v3 v3.0.1
 )
 
-require github.com/hashicorp/golang-lru v1.0.2 // indirect
-
 require (
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.7.0 // indirect
 	github.com/Azure/azure-sdk-for-go/sdk/internal v1.3.0 // indirect

@@ -18,6 +18,7 @@
 package p2p
 
 import (
+	"bufio"
 	"bytes"
 	"cmp"
 	"crypto/ecdsa"
@@ -26,6 +27,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -112,6 +114,9 @@ type Server struct {
 
 	// State of run loop and listenLoop.
 	inboundHistory expHeap
+
+	latencyFile   *os.File
+	latencyWriter *bufio.Writer
 }
 
 type peerOpFunc func(map[enode.ID]*Peer)
@@ -328,6 +333,8 @@ func (srv *Server) Stop() {
 	close(srv.quit)
 	srv.lock.Unlock()
 	srv.loopWG.Wait()
+	srv.latencyWriter.Flush()
+	srv.latencyFile.Close()
 }
 
 // sharedUDPConn implements a shared connection. Write sends messages to the underlying connection while read returns
@@ -365,6 +372,13 @@ func (srv *Server) Start() (err error) {
 		return errors.New("server already running")
 	}
 	srv.running = true
+	latencyFile, err := os.OpenFile("latency.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	latencyWriter := bufio.NewWriter(latencyFile)
+	srv.latencyFile = latencyFile
+	srv.latencyWriter = latencyWriter
 	srv.log = srv.Logger
 	if srv.log == nil {
 		srv.log = log.Root()
@@ -967,7 +981,7 @@ func (srv *Server) checkpoint(c *conn, stage chan<- *conn) error {
 }
 
 func (srv *Server) launchPeer(c *conn) *Peer {
-	p := newPeer(srv.log, c, srv.Protocols)
+	p := newPeer(srv.log, c, srv.Protocols, srv.latencyWriter)
 	if srv.EnableMsgEvents {
 		// If message events are enabled, pass the peerFeed
 		// to the peer.
