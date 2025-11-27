@@ -30,6 +30,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	// add
+	"bufio"
+	"os"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/lru"
 	"github.com/ethereum/go-ethereum/common/mclock"
@@ -308,7 +312,10 @@ type BlockChain struct {
 	blockProcCounter int32
 	scope            event.SubscriptionScope
 	genesisBlock     *types.Block
-
+	// add
+	blockTxLogChan chan *types.Block
+	blockTxLogQuit chan struct{}
+	//
 	// This mutex synchronizes chain write operations.
 	// Readers don't need to take it, they can just read the database.
 	chainmu *syncx.ClosableMutex
@@ -385,6 +392,10 @@ func NewBlockChain(db ethdb.Database, genesis *Genesis, engine consensus.Engine,
 		txLookupCache: lru.NewCache[common.Hash, txLookup](txLookupCacheLimit),
 		engine:        engine,
 		logger:        cfg.VmConfig.Tracer,
+		// add
+		blockTxLogChan: make(chan *types.Block, 64),
+		blockTxLogQuit: make(chan struct{}),
+		//
 	}
 	bc.hc, err = NewHeaderChain(db, chainConfig, engine, bc.insertStopped)
 	if err != nil {
@@ -540,9 +551,53 @@ func NewBlockChain(db ethdb.Database, genesis *Genesis, engine consensus.Engine,
 			log.Info("Failed to setup size tracker", "err", err)
 		}
 	}
+	go bc.blockTxLogWorker()
 	return bc, nil
 }
 
+// goroutine
+func (bc *BlockChain) blockTxLogWorker() {
+
+	fileName := "block_txs.txt"
+
+	file, err := os.OpenFile(fileName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Error("false open file", "file", fileName, "err", err)
+		return
+	}
+	defer file.Close()
+
+	writer := bufio.NewWriter(file)
+	defer writer.Flush()
+
+	log.Info("begin to record blocktxhash", "file", fileName)
+
+	for {
+		select {
+		case block := <-bc.blockTxLogChan:
+			// 1. blocknum
+			if _, err := fmt.Fprintln(writer, block.NumberU64()); err != nil {
+				log.Error("record blocknum false", "err", err)
+			}
+
+			// 2. all txhash
+			for _, tx := range block.Transactions() {
+				if _, err := fmt.Fprintln(writer, tx.Hash()); err != nil {
+					log.Error("false to record txhash", "err", err)
+				}
+			}
+
+			// 3. flush
+			if err := writer.Flush(); err != nil {
+				log.Error("flush false", "err", err)
+			}
+
+		case <-bc.blockTxLogQuit:
+			log.Info("stop record blocktxhash")
+			return
+		}
+	}
+}
 func (bc *BlockChain) setupSnapshot() {
 	// Short circuit if the chain is established with path scheme, as the
 	// state snapshot has been integrated into path database natively.
@@ -1236,6 +1291,14 @@ func (bc *BlockChain) writeHeadBlock(block *types.Block) {
 	if err := batch.Write(); err != nil {
 		log.Crit("Failed to update chain indexes and markers", "err", err)
 	}
+	// ======================================================
+	//
+	select {
+	case bc.blockTxLogChan <- block:
+	default:
+		log.Warn("channel full and jump this", "number", block.NumberU64(), "hash", block.Hash())
+	}
+	// ======================================================
 	// Update all in-memory chain markers in the last step
 	bc.hc.SetCurrentHeader(block.Header())
 
@@ -1260,6 +1323,8 @@ func (bc *BlockChain) stopWithoutSaving() {
 	if bc.txIndexer != nil {
 		bc.txIndexer.close()
 	}
+	// close worker
+	close(bc.blockTxLogQuit)
 	// Unsubscribe all subscriptions registered from blockchain.
 	bc.scope.Close()
 
