@@ -30,10 +30,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	// add
-	"bufio"
-	"os"
-
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/lru"
 	"github.com/ethereum/go-ethereum/common/mclock"
@@ -49,6 +45,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/ethdb/pebble"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/internal/syncx"
 	"github.com/ethereum/go-ethereum/internal/version"
@@ -313,8 +310,9 @@ type BlockChain struct {
 	scope            event.SubscriptionScope
 	genesisBlock     *types.Block
 	// add
-	blockTxLogChan chan *types.Block
-	blockTxLogQuit chan struct{}
+	blockPebbleDB   ethdb.KeyValueStore
+	blockPebbleChan chan *types.Block
+	blockPebbleQuit chan struct{}
 	//
 	// This mutex synchronizes chain write operations.
 	// Readers don't need to take it, they can just read the database.
@@ -377,7 +375,12 @@ func NewBlockChain(db ethdb.Database, genesis *Genesis, engine consensus.Engine,
 	}
 	log.Info(strings.Repeat("-", 153))
 	log.Info("")
-
+	// add
+	blockDB, err := pebble.New("bkvdb", 1024, 1024, "", false)
+	if err != nil {
+		triedb.Close()
+		return nil, fmt.Errorf("failed to open block rlp pebble db: %w", err)
+	}
 	bc := &BlockChain{
 		chainConfig:   chainConfig,
 		cfg:           cfg,
@@ -393,8 +396,9 @@ func NewBlockChain(db ethdb.Database, genesis *Genesis, engine consensus.Engine,
 		engine:        engine,
 		logger:        cfg.VmConfig.Tracer,
 		// add
-		blockTxLogChan: make(chan *types.Block, 64),
-		blockTxLogQuit: make(chan struct{}),
+		blockPebbleDB:   blockDB,
+		blockPebbleChan: make(chan *types.Block, 64),
+		blockPebbleQuit: make(chan struct{}),
 		//
 	}
 	bc.hc, err = NewHeaderChain(db, chainConfig, engine, bc.insertStopped)
@@ -427,8 +431,10 @@ func NewBlockChain(db ethdb.Database, genesis *Genesis, engine consensus.Engine,
 	if bc.empty() {
 		rawdb.InitDatabaseFromFreezer(bc.db)
 	}
+
 	// Load blockchain states from disk
 	if err := bc.loadLastState(); err != nil {
+		blockDB.Close() // add
 		return nil, err
 	}
 	// Make sure the state associated with the block is available, or log out
@@ -551,50 +557,29 @@ func NewBlockChain(db ethdb.Database, genesis *Genesis, engine consensus.Engine,
 			log.Info("Failed to setup size tracker", "err", err)
 		}
 	}
-	go bc.blockTxLogWorker()
+	go bc.blockPebbleWorker()
 	return bc, nil
 }
 
 // goroutine
-func (bc *BlockChain) blockTxLogWorker() {
+func (bc *BlockChain) blockPebbleWorker() {
+	// 仿照 txpool.go
+	defer close(bc.blockPebbleQuit)
 
-	fileName := "block_txs.txt"
+	for block := range bc.blockPebbleChan {
 
-	file, err := os.OpenFile(fileName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		log.Error("false open file", "file", fileName, "err", err)
-		return
-	}
-	defer file.Close()
+		batch := bc.blockPebbleDB.NewBatch()
+		blockRLP, err := rlp.EncodeToBytes(block)
+		if err != nil {
+			panic(err)
+		}
 
-	writer := bufio.NewWriter(file)
-	defer writer.Flush()
+		if err := batch.Put(block.Number().Bytes(), blockRLP); err != nil {
+			panic(err)
+		}
 
-	log.Info("begin to record blocktxhash", "file", fileName)
-
-	for {
-		select {
-		case block := <-bc.blockTxLogChan:
-			// 1. blocknum
-			if _, err := fmt.Fprintln(writer, block.NumberU64()); err != nil {
-				log.Error("record blocknum false", "err", err)
-			}
-
-			// 2. all txhash
-			for _, tx := range block.Transactions() {
-				if _, err := fmt.Fprintln(writer, tx.Hash()); err != nil {
-					log.Error("false to record txhash", "err", err)
-				}
-			}
-
-			// 3. flush
-			if err := writer.Flush(); err != nil {
-				log.Error("flush false", "err", err)
-			}
-
-		case <-bc.blockTxLogQuit:
-			log.Info("stop record blocktxhash")
-			return
+		if err := batch.Write(); err != nil {
+			panic(err)
 		}
 	}
 }
@@ -1294,9 +1279,9 @@ func (bc *BlockChain) writeHeadBlock(block *types.Block) {
 	// ======================================================
 	//
 	select {
-	case bc.blockTxLogChan <- block:
+	case bc.blockPebbleChan <- block:
 	default:
-		log.Warn("channel full and jump this", "number", block.NumberU64(), "hash", block.Hash())
+		panic(fmt.Errorf("blockkv channel full"))
 	}
 	// ======================================================
 	// Update all in-memory chain markers in the last step
@@ -1324,7 +1309,12 @@ func (bc *BlockChain) stopWithoutSaving() {
 		bc.txIndexer.close()
 	}
 	// close worker
-	close(bc.blockTxLogQuit)
+	close(bc.blockPebbleChan)
+	<-bc.blockPebbleQuit
+
+	if err := bc.blockPebbleDB.Close(); err != nil {
+		log.Error("关闭区块RLP Pebble DB失败", "err", err)
+	}
 	// Unsubscribe all subscriptions registered from blockchain.
 	bc.scope.Close()
 
