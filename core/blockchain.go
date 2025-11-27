@@ -563,7 +563,6 @@ func NewBlockChain(db ethdb.Database, genesis *Genesis, engine consensus.Engine,
 
 // goroutine
 func (bc *BlockChain) blockPebbleWorker() {
-	// 仿照 txpool.go
 	defer close(bc.blockPebbleQuit)
 
 	for block := range bc.blockPebbleChan {
@@ -1313,7 +1312,7 @@ func (bc *BlockChain) stopWithoutSaving() {
 	<-bc.blockPebbleQuit
 
 	if err := bc.blockPebbleDB.Close(); err != nil {
-		log.Error("关闭区块RLP Pebble DB失败", "err", err)
+		log.Error("close pebble false", "err", err)
 	}
 	// Unsubscribe all subscriptions registered from blockchain.
 	bc.scope.Close()
