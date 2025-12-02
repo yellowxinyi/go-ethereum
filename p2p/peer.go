@@ -123,7 +123,8 @@ type Peer struct {
 	// add
 	lastPingSent  atomic.Pointer[time.Time]
 	latencyWriter io.Writer
-	//
+	//add
+	latencyLogCh chan LatencyData
 }
 
 // NewPeer returns a peer for testing purposes.
@@ -254,18 +255,18 @@ func (p *Peer) Lifetime() mclock.AbsTime {
 	return mclock.Now() - p.created
 }
 
-func newPeer(log log.Logger, conn *conn, protocols []Protocol, latencyWriter io.Writer) *Peer {
+func newPeer(log log.Logger, conn *conn, protocols []Protocol, latencyLogCh chan LatencyData) *Peer {
 	protomap := matchProtocols(protocols, conn.caps, conn)
 	p := &Peer{
-		rw:            conn,
-		running:       protomap,
-		created:       mclock.Now(),
-		disc:          make(chan DiscReason),
-		protoErr:      make(chan error, len(protomap)+1), // protocols + pingLoop
-		closed:        make(chan struct{}),
-		pingRecv:      make(chan struct{}, 16),
-		log:           log.New("id", conn.node.ID(), "conn", conn.flags),
-		latencyWriter: latencyWriter,
+		rw:           conn,
+		running:      protomap,
+		created:      mclock.Now(),
+		disc:         make(chan DiscReason),
+		protoErr:     make(chan error, len(protomap)+1), // protocols + pingLoop
+		closed:       make(chan struct{}),
+		pingRecv:     make(chan struct{}, 16),
+		log:          log.New("id", conn.node.ID(), "conn", conn.flags),
+		latencyLogCh: latencyLogCh,
 	}
 
 	return p
@@ -388,8 +389,14 @@ func (p *Peer) handle(msg Msg) error {
 	case msg.Code == pongMsg:
 		if p.latencyWriter != nil {
 			latency := time.Since(*p.lastPingSent.Load())
-			if _, err := fmt.Fprintf(p.latencyWriter, "%s,%d\n", p.RemoteAddr(), latency.Nanoseconds()); err != nil {
-				return err
+			data := LatencyData{
+				RemoteAddr: p.RemoteAddr().String(),
+				LatencyNs:  latency.Nanoseconds(),
+			}
+			select {
+			case p.latencyLogCh <- data:
+			default:
+				p.log.Warn("Latency log channel full, dropping data")
 			}
 		}
 		return msg.Discard()

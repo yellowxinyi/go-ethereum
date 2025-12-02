@@ -117,6 +117,8 @@ type Server struct {
 
 	latencyFile   *os.File
 	latencyWriter *bufio.Writer
+	// add for Peer Channel
+	latencyLogCh chan LatencyData
 }
 
 type peerOpFunc func(map[enode.ID]*Peer)
@@ -160,6 +162,12 @@ type transport interface {
 	// the tests. Closing the actual network connection doesn't do
 	// anything in those tests because MsgPipe doesn't use it.
 	close(err error)
+}
+
+// add for channel
+type LatencyData struct {
+	RemoteAddr string
+	LatencyNs  int64
 }
 
 func (c *conn) String() string {
@@ -331,10 +339,31 @@ func (srv *Server) Stop() {
 		srv.listener.Close()
 	}
 	close(srv.quit)
+	// close Channel
+	if srv.latencyLogCh != nil {
+		close(srv.latencyLogCh)
+	}
 	srv.lock.Unlock()
 	srv.loopWG.Wait()
 	srv.latencyWriter.Flush()
 	srv.latencyFile.Close()
+}
+
+// add for chennel IO
+
+func (srv *Server) runIOLogger() {
+	defer srv.loopWG.Done()
+
+	for data := range srv.latencyLogCh {
+
+		if _, err := fmt.Fprintf(srv.latencyWriter, "%s,%d\n", data.RemoteAddr, data.LatencyNs); err != nil {
+			srv.log.Error("Failed to write latency log",
+				"err", err,
+				"addr", data.RemoteAddr,
+				"latency", data.LatencyNs)
+		}
+	}
+	srv.log.Trace("Latency logger stopped")
 }
 
 // sharedUDPConn implements a shared connection. Write sends messages to the underlying connection while read returns
@@ -379,6 +408,9 @@ func (srv *Server) Start() (err error) {
 	latencyWriter := bufio.NewWriter(latencyFile)
 	srv.latencyFile = latencyFile
 	srv.latencyWriter = latencyWriter
+	// add
+	srv.latencyLogCh = make(chan LatencyData, 50000)
+	//
 	srv.log = srv.Logger
 	if srv.log == nil {
 		srv.log = log.Root()
@@ -424,6 +456,9 @@ func (srv *Server) Start() (err error) {
 	}
 	srv.setupDialScheduler()
 
+	srv.loopWG.Add(1)
+	// add latencyLogCh
+	go srv.runIOLogger()
 	srv.loopWG.Add(1)
 	go srv.run()
 	return nil
@@ -981,7 +1016,7 @@ func (srv *Server) checkpoint(c *conn, stage chan<- *conn) error {
 }
 
 func (srv *Server) launchPeer(c *conn) *Peer {
-	p := newPeer(srv.log, c, srv.Protocols, srv.latencyWriter)
+	p := newPeer(srv.log, c, srv.Protocols, srv.latencyLogCh)
 	if srv.EnableMsgEvents {
 		// If message events are enabled, pass the peerFeed
 		// to the peer.
