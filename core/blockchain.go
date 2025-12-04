@@ -30,6 +30,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	// add
+	"os"
+	"path/filepath"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/lru"
 	"github.com/ethereum/go-ethereum/common/mclock"
@@ -45,7 +49,8 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/ethdb"
-	"github.com/ethereum/go-ethereum/ethdb/pebble"
+
+	//"github.com/ethereum/go-ethereum/ethdb/pebble"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/internal/syncx"
 	"github.com/ethereum/go-ethereum/internal/version"
@@ -310,7 +315,7 @@ type BlockChain struct {
 	scope            event.SubscriptionScope
 	genesisBlock     *types.Block
 	// add
-	blockPebbleDB   ethdb.KeyValueStore
+	//blockPebbleDB   ethdb.KeyValueStore
 	blockPebbleChan chan *types.Block
 	blockPebbleQuit chan struct{}
 	//
@@ -376,11 +381,12 @@ func NewBlockChain(db ethdb.Database, genesis *Genesis, engine consensus.Engine,
 	log.Info(strings.Repeat("-", 153))
 	log.Info("")
 	// add
-	blockDB, err := pebble.New("bkvdb", 1024, 1024, "", false)
-	if err != nil {
+	blockOutDir := "blocks"
+	if err := os.MkdirAll(blockOutDir, 0755); err != nil {
 		triedb.Close()
-		return nil, fmt.Errorf("failed to open block rlp pebble db: %w", err)
+		return nil, fmt.Errorf("failed to create block output directory: %w", err)
 	}
+	// ------------------------------------------------------
 	bc := &BlockChain{
 		chainConfig:   chainConfig,
 		cfg:           cfg,
@@ -396,7 +402,7 @@ func NewBlockChain(db ethdb.Database, genesis *Genesis, engine consensus.Engine,
 		engine:        engine,
 		logger:        cfg.VmConfig.Tracer,
 		// add
-		blockPebbleDB:   blockDB,
+		//blockPebbleDB:   blockDB,
 		blockPebbleChan: make(chan *types.Block, 64),
 		blockPebbleQuit: make(chan struct{}),
 		//
@@ -434,7 +440,6 @@ func NewBlockChain(db ethdb.Database, genesis *Genesis, engine consensus.Engine,
 
 	// Load blockchain states from disk
 	if err := bc.loadLastState(); err != nil {
-		blockDB.Close() // add
 		return nil, err
 	}
 	// Make sure the state associated with the block is available, or log out
@@ -564,21 +569,17 @@ func NewBlockChain(db ethdb.Database, genesis *Genesis, engine consensus.Engine,
 // goroutine
 func (bc *BlockChain) blockPebbleWorker() {
 	defer close(bc.blockPebbleQuit)
-
+	outputDir := "blocks"
 	for block := range bc.blockPebbleChan {
-
-		batch := bc.blockPebbleDB.NewBatch()
 		blockRLP, err := rlp.EncodeToBytes(block)
+
 		if err != nil {
 			panic(err)
 		}
-
-		if err := batch.Put(block.Number().Bytes(), blockRLP); err != nil {
-			panic(err)
-		}
-
-		if err := batch.Write(); err != nil {
-			panic(err)
+		fileName := fmt.Sprintf("%d.rlp", block.NumberU64())
+		filePath := filepath.Join(outputDir, fileName)
+		if err := os.WriteFile(filePath, blockRLP, 0644); err != nil {
+			panic(fmt.Errorf("failed to write block file %s: %w", filePath, err))
 		}
 	}
 }
@@ -1311,9 +1312,6 @@ func (bc *BlockChain) stopWithoutSaving() {
 	close(bc.blockPebbleChan)
 	<-bc.blockPebbleQuit
 
-	if err := bc.blockPebbleDB.Close(); err != nil {
-		log.Error("close pebble false", "err", err)
-	}
 	// Unsubscribe all subscriptions registered from blockchain.
 	bc.scope.Close()
 
