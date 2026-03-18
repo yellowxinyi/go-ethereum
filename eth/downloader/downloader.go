@@ -55,6 +55,10 @@ var (
 	fsHeaderSafetyNet = 2048            // Number of headers to discard in case a chain violation is detected
 	fsHeaderContCheck = 3 * time.Second // Time interval to check for header continuations during state download
 	fsMinFullBlocks   = 64              // Number of blocks to retrieve fully even in snap sync
+
+	// snapBodyKeepBlocks is the number of most recent blocks for which bodies are kept
+	// during snap sync in the ultra-light observation mode.
+	snapBodyKeepBlocks = 128
 )
 
 var (
@@ -128,6 +132,11 @@ type Downloader struct {
 	// chain segment is aimed for synchronization.
 	chainCutoffNumber uint64
 	chainCutoffHash   common.Hash
+
+	// Body cut-off for snap sync ultra-light observation mode. Bodies at or
+	// below this height are skipped, while headers and receipts are retained.
+	bodyCutoffNumber  uint64
+	bodyCutoffEnabled bool
 
 	// Channels
 	headerProcCh chan *headerTask // Channel to feed the header processor new tasks
@@ -572,15 +581,21 @@ func (d *Downloader) syncToHead() (err error) {
 			log.Info("Truncated excess ancient chain segment", "oldhead", frozen-1, "newhead", origin)
 		}
 	}
-	// Skip ancient chain segments if Geth is running with a configured chain cutoff.
-	// These segments are not guaranteed to be available in the network.
-	chainOffset := origin + 1
-	if mode == ethconfig.SnapSync && d.chainCutoffNumber != 0 {
-		if chainOffset < d.chainCutoffNumber {
-			chainOffset = d.chainCutoffNumber
-			log.Info("Skip chain segment before cutoff", "origin", origin, "cutoff", d.chainCutoffNumber)
+	// Configure the snap-body cutoff for the ultra-light observation mode.
+	if mode == ethconfig.SnapSync {
+		if height >= snapBodyKeepBlocks {
+			d.bodyCutoffNumber = height - snapBodyKeepBlocks
+			d.bodyCutoffEnabled = true
+		} else {
+			d.bodyCutoffNumber = 0
+			d.bodyCutoffEnabled = false
 		}
+	} else {
+		d.bodyCutoffNumber = 0
+		d.bodyCutoffEnabled = false
 	}
+	// Keep the result cache aligned with the earliest header to process.
+	chainOffset := origin + 1
 	// Initiate the sync using a concurrent header and content retrieval algorithm
 	d.queue.Prepare(chainOffset, mode)
 
@@ -770,18 +785,20 @@ func (d *Downloader) processHeaders(origin uint64) error {
 					case <-timer.C:
 					}
 				}
-				// Otherwise, schedule the headers for content retrieval (block bodies and
-				// potentially receipts in snap sync).
-				//
-				// Skip the bodies/receipts retrieval scheduling before the cutoff in snap
-				// sync if chain pruning is configured.
+				// Otherwise, schedule the headers for content retrieval. In snap sync,
+				// bodies are only scheduled for the last snapBodyKeepBlocks, while
+				// receipts are always scheduled.
+				scheduleHeaders := chunkHeaders
+				scheduleHashes := chunkHashes
+				scheduleOrigin := origin
 				if mode == ethconfig.SnapSync && cutoff != 0 {
-					chunkHeaders = chunkHeaders[cutoff:]
-					chunkHashes = chunkHashes[cutoff:]
+					scheduleHeaders = chunkHeaders[cutoff:]
+					scheduleHashes = chunkHashes[cutoff:]
+					scheduleOrigin = origin + uint64(cutoff)
 				}
-				if len(chunkHeaders) > 0 {
+				if len(scheduleHeaders) > 0 {
 					scheduled = true
-					if d.queue.Schedule(chunkHeaders, chunkHashes, origin+uint64(cutoff)) != len(chunkHeaders) {
+					if d.queue.ScheduleWithBodyCutoff(scheduleHeaders, scheduleHashes, scheduleOrigin, d.bodyCutoffEnabled, d.bodyCutoffNumber) != len(scheduleHeaders) {
 						return fmt.Errorf("%w: stale headers", errBadPeer)
 					}
 				}
