@@ -198,6 +198,10 @@ type BlockChainConfig struct {
 
 	// StateSizeTracking indicates whether the state size tracking is enabled.
 	StateSizeTracking bool
+
+	// SnapBodyKeepBlocks keeps only the latest N block bodies when snap sync is used.
+	// Zero disables body pruning.
+	SnapBodyKeepBlocks uint64
 }
 
 // DefaultConfig returns the default config.
@@ -1473,6 +1477,13 @@ func (bc *BlockChain) InsertReceiptChain(blockChain types.Blocks, receiptChain [
 			skipPresenceCheck = false
 			batch             = bc.db.NewBatch()
 		)
+		var bodyCutoff uint64
+		if keep := bc.cfg.SnapBodyKeepBlocks; keep > 0 {
+			last := blockChain[len(blockChain)-1].NumberU64()
+			if last >= keep {
+				bodyCutoff = last - keep
+			}
+		}
 		for i, block := range blockChain {
 			// Short circuit insertion if shutting down or processing failed
 			if bc.insertStopped() {
@@ -1492,7 +1503,18 @@ func (bc *BlockChain) InsertReceiptChain(blockChain types.Blocks, receiptChain [
 			}
 			// Write all the data out into the database
 			rawdb.WriteCanonicalHash(batch, block.Hash(), block.NumberU64())
-			rawdb.WriteBlock(batch, block)
+			rawdb.WriteHeader(batch, block.Header())
+			missingBody := !block.Header().EmptyBody() &&
+				len(block.Transactions()) == 0 &&
+				len(block.Uncles()) == 0 &&
+				len(block.Withdrawals()) == 0
+			if missingBody || (bodyCutoff != 0 && block.NumberU64() <= bodyCutoff) {
+				if block.NumberU64() != 0 {
+					rawdb.DeleteBody(batch, block.Hash(), block.NumberU64())
+				}
+			} else {
+				rawdb.WriteBody(batch, block.Hash(), block.NumberU64(), block.Body())
+			}
 			rawdb.WriteRawReceipts(batch, block.Hash(), block.NumberU64(), receiptChain[i])
 
 			// Write everything belongs to the blocks into the database. So that
@@ -1707,6 +1729,7 @@ func (bc *BlockChain) writeBlockAndSetHead(block *types.Block, receipts []*types
 	if emitHeadEvent {
 		bc.chainHeadFeed.Send(ChainHeadEvent{Header: block.Header()})
 	}
+	bc.pruneBodyIfNeeded(block.NumberU64())
 	return CanonStatTy, nil
 }
 
@@ -1966,6 +1989,31 @@ func (bc *BlockChain) insertChain(chain types.Blocks, setHead bool, makeWitness 
 
 	stats.ignored += it.remaining()
 	return witness, it.index, err
+}
+
+// pruneBodyIfNeeded removes the body at height (head - keep) to enforce a rolling
+// retention window. It only applies when SnapBodyKeepBlocks is configured.
+func (bc *BlockChain) pruneBodyIfNeeded(head uint64) {
+	keep := bc.cfg.SnapBodyKeepBlocks
+	if keep == 0 || head < keep {
+		return
+	}
+	cutoff := head - keep
+	hash := rawdb.ReadCanonicalHash(bc.db, cutoff)
+	if hash == (common.Hash{}) {
+		return
+	}
+	rawdb.DeleteBody(bc.db, hash, cutoff)
+	// Best-effort cache invalidation.
+	if body, ok := bc.bodyCache.Get(hash); ok && body != nil {
+		bc.bodyCache.Remove(hash)
+	}
+	if _, ok := bc.bodyRLPCache.Get(hash); ok {
+		bc.bodyRLPCache.Remove(hash)
+	}
+	if block, ok := bc.blockCache.Get(hash); ok && block != nil {
+		bc.blockCache.Remove(hash)
+	}
 }
 
 // blockProcessingResult is a summary of block processing

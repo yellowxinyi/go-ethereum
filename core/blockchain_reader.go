@@ -151,7 +151,14 @@ func (bc *BlockChain) HasBlock(hash common.Hash, number uint64) bool {
 	if !bc.HasHeader(hash, number) {
 		return false
 	}
-	return rawdb.HasBody(bc.db, hash, number)
+	if rawdb.HasBody(bc.db, hash, number) {
+		return true
+	}
+	// In snap ultra-light mode, treat header-only blocks as present.
+	if bc.cfg.SnapBodyKeepBlocks > 0 {
+		return true
+	}
+	return false
 }
 
 // HasFastBlock checks if a fast block is fully present in the database or not.
@@ -174,7 +181,14 @@ func (bc *BlockChain) GetBlock(hash common.Hash, number uint64) *types.Block {
 	}
 	block := rawdb.ReadBlock(bc.db, hash, number)
 	if block == nil {
-		return nil
+		if bc.cfg.SnapBodyKeepBlocks > 0 {
+			if header := rawdb.ReadHeader(bc.db, hash, number); header != nil {
+				block = types.NewBlockWithHeader(header)
+			}
+		}
+		if block == nil {
+			return nil
+		}
 	}
 	// Cache the found block for next time and return
 	bc.blockCache.Add(block.Hash(), block)
