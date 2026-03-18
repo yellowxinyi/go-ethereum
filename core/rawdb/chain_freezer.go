@@ -24,9 +24,11 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb/eradb"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/rlp"
 )
 
 const (
@@ -39,6 +41,11 @@ const (
 	// before doing an fsync and deleting it from the key-value store.
 	freezerBatchLimit = 30000
 )
+
+var emptyBodyRLP = func() rlp.RawValue {
+	data, _ := rlp.EncodeToBytes(&types.Body{})
+	return data
+}()
 
 // chainFreezer is a wrapper of chain ancient store with additional chain freezing
 // feature. The background thread will keep moving ancient chain segments from
@@ -321,7 +328,7 @@ func (f *chainFreezer) freezeRange(nfdb *nofreezedb, number, limit uint64) (hash
 			}
 			body := ReadBodyRLP(nfdb, hash, number)
 			if len(body) == 0 {
-				return fmt.Errorf("block body missing, can't freeze block %d", number)
+				body = emptyBodyRLP
 			}
 			receipts := ReadReceiptsRLP(nfdb, hash, number)
 			if len(receipts) == 0 {

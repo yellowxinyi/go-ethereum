@@ -255,6 +255,9 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 			EnableWitnessStats:      config.EnableWitnessStats,
 		}
 	)
+	if config.SyncMode == ethconfig.SnapSync {
+		options.SnapBodyKeepBlocks = 128
+	}
 	if config.VMTrace != "" {
 		traceConfig := json.RawMessage("{}")
 		if config.VMTraceJsonConfig != "" {
