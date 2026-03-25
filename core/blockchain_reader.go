@@ -434,6 +434,9 @@ func (bc *BlockChain) StateAt(root common.Hash) (*state.StateDB, error) {
 // Live states are not available and won't be served, please use `State`
 // or `StateAt` instead.
 func (bc *BlockChain) HistoricState(root common.Hash) (*state.StateDB, error) {
+	if bc.cfg.ObservationMode {
+		return nil, errors.New("historic state is not available in observation mode")
+	}
 	return state.New(root, state.NewHistoricDatabase(bc.triedb, bc.codedb))
 }
 
@@ -504,6 +507,11 @@ func (bc *BlockChain) TrieDB() *triedb.Database {
 // CodeDB retrieves the low level contract code database used for data storage.
 func (bc *BlockChain) CodeDB() *state.CodeDB {
 	return bc.codedb
+}
+
+// ObservationMode reports whether the chain is running in observation mode.
+func (bc *BlockChain) ObservationMode() bool {
+	return bc.cfg.ObservationMode
 }
 
 // HeaderChain returns the underlying header chain.

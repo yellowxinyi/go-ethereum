@@ -91,6 +91,17 @@ func newFlatReader(reader database.StateReader) *flatReader {
 	return &flatReader{reader: reader}
 }
 
+// plainReader wraps a KV reader and is safe for concurrent access.
+// It reads state from the plain (address/slot) KV view.
+type plainReader struct {
+	db ethdb.KeyValueReader
+}
+
+// newPlainReader constructs a plain state reader backed by rawdb flat-KV accessors.
+func newPlainReader(db ethdb.KeyValueReader) *plainReader {
+	return &plainReader{db: db}
+}
+
 // Account implements StateReader, retrieving the account specified by the address.
 //
 // An error will be returned if the associated snapshot is already stale or
@@ -140,6 +151,58 @@ func (r *flatReader) Storage(addr common.Address, key common.Hash) (common.Hash,
 	// Perform the rlp-decode as the slot value is RLP-encoded in the state
 	// snapshot.
 	_, content, _, err := rlp.Split(ret)
+	if err != nil {
+		return common.Hash{}, err
+	}
+	var value common.Hash
+	value.SetBytes(content)
+	return value, nil
+}
+
+// Account implements StateReader for plain-KV, retrieving the account specified by address.
+func (r *plainReader) Account(addr common.Address) (*types.StateAccount, error) {
+	data := rawdb.ReadPlainAccount(r.db, addr)
+	if len(data) == 0 {
+		// Fallback to hashed view if plain state is not yet populated.
+		addrHash := crypto.Keccak256Hash(addr.Bytes())
+		data = rawdb.ReadHashedAccount(r.db, addrHash)
+	}
+	if len(data) == 0 {
+		return nil, nil
+	}
+	var account types.StateAccount
+	if err := rlp.DecodeBytes(data, &account); err != nil {
+		return nil, err
+	}
+	// Normalize empty fields to consensus defaults.
+	if len(account.CodeHash) == 0 {
+		account.CodeHash = types.EmptyCodeHash.Bytes()
+	}
+	if account.Root == (common.Hash{}) {
+		account.Root = types.EmptyRootHash
+	}
+	return &account, nil
+}
+
+// Storage implements StateReader for plain-KV, retrieving the storage slot specified by address and key.
+func (r *plainReader) Storage(addr common.Address, key common.Hash) (common.Hash, error) {
+	incarnation, _ := rawdb.ReadPlainIncarnation(r.db, addr)
+	data := rawdb.ReadPlainStorage(r.db, addr, incarnation, key)
+	if len(data) == 0 {
+		// Fallback to hashed view if plain state is not yet populated.
+		addrHash := crypto.Keccak256Hash(addr.Bytes())
+		hashedIncarnation, _ := rawdb.ReadHashedIncarnation(r.db, addrHash)
+		slotHash := crypto.Keccak256Hash(key.Bytes())
+		data = rawdb.ReadHashedStorage(r.db, addrHash, hashedIncarnation, slotHash)
+	}
+	if len(data) == 0 {
+		return common.Hash{}, nil
+	}
+	// Prefer raw 32-byte storage values; fall back to RLP-decoding if needed.
+	if len(data) == common.HashLength {
+		return common.BytesToHash(data), nil
+	}
+	_, content, _, err := rlp.Split(data)
 	if err != nil {
 		return common.Hash{}, err
 	}

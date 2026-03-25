@@ -300,3 +300,8 @@ func (db *HistoricDB) Snapshot() *snapshot.Tree {
 func (db *HistoricDB) Commit(update *stateUpdate) error {
 	return errors.New("not implemented")
 }
+
+// ObservationMode reports whether the database is in observation mode.
+func (db *HistoricDB) ObservationMode() bool {
+	return false
+}

@@ -823,6 +823,10 @@ func (s *StateDB) Finalise(deleteEmptyObjects bool) {
 // It is called in between transactions to get the root hash that
 // goes into transaction receipts.
 func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
+	if s.db.ObservationMode() {
+		s.Finalise(deleteEmptyObjects)
+		return types.EmptyRootHash
+	}
 	// Finalise all the dirty storage states and write them into the tries
 	s.Finalise(deleteEmptyObjects)
 
@@ -1215,6 +1219,9 @@ func (s *StateDB) commit(deleteEmptyObjects bool, noStorageWiping bool, blockNum
 	if s.dbErr != nil {
 		return nil, fmt.Errorf("commit aborted due to earlier error: %v", s.dbErr)
 	}
+	if s.db.ObservationMode() {
+		return s.commitObservation(deleteEmptyObjects, noStorageWiping, blockNumber)
+	}
 	// Finalize any pending changes and merge everything into the tries
 	s.IntermediateRoot(deleteEmptyObjects)
 
@@ -1365,6 +1372,81 @@ func (s *StateDB) commit(deleteEmptyObjects bool, noStorageWiping bool, blockNum
 	return newStateUpdate(noStorageWiping, origin, root, blockNumber, deletes, updates, nodes), nil
 }
 
+// commitObservation writes state mutations into plain/hashed KV without trie maintenance.
+func (s *StateDB) commitObservation(deleteEmptyObjects bool, noStorageWiping bool, blockNumber uint64) (*stateUpdate, error) {
+	// Finalize all the dirty storage states without touching tries.
+	s.Finalise(deleteEmptyObjects)
+	if s.dbErr != nil {
+		return nil, fmt.Errorf("commit aborted due to database error: %v", s.dbErr)
+	}
+	var (
+		deletes = make(map[common.Hash]*accountDelete)
+		updates = make(map[common.Hash]*accountUpdate, len(s.mutations))
+	)
+	// Apply account deletions to plain/hashed KV.
+	if disk := s.db.TrieDB().Disk(); disk != nil {
+		batch := disk.NewBatch()
+		for addr, prevObj := range s.stateObjectsDestruct {
+			prev := prevObj.origin
+			if prev == nil {
+				continue
+			}
+			addrHash := crypto.Keccak256Hash(addr.Bytes())
+			deletes[addrHash] = &accountDelete{
+				address: addr,
+				origin:  types.SlimAccountRLP(*prev),
+			}
+			plainIncarnation, _ := rawdb.ReadPlainIncarnation(disk, addr)
+			hashedIncarnation, _ := rawdb.ReadHashedIncarnation(disk, addrHash)
+			rawdb.WritePlainIncarnation(batch, addr, plainIncarnation+1)
+			rawdb.WriteHashedIncarnation(batch, addrHash, hashedIncarnation+1)
+			rawdb.DeletePlainAccount(batch, addr)
+			rawdb.DeleteHashedAccount(batch, addrHash)
+		}
+		if err := batch.Write(); err != nil {
+			return nil, err
+		}
+	}
+	// Apply account updates to plain/hashed KV.
+	for addr, op := range s.mutations {
+		if op.isDelete() {
+			continue
+		}
+		obj := s.stateObjects[addr]
+		if obj == nil {
+			return nil, errors.New("missing state object")
+		}
+		update, _, err := obj.commit()
+		if err != nil {
+			return nil, err
+		}
+		updates[obj.addrHash] = update
+	}
+	// Update metrics with non-trie counters.
+	accountReadMeters.Mark(int64(s.AccountLoaded))
+	storageReadMeters.Mark(int64(s.StorageLoaded))
+	accountUpdatedMeter.Mark(int64(s.AccountUpdated))
+	storageUpdatedMeter.Mark(s.StorageUpdated.Load())
+	accountDeletedMeter.Mark(int64(s.AccountDeleted))
+	storageDeletedMeter.Mark(int64(s.StorageDeleted.Load()))
+
+	// Clear the metric markers
+	s.AccountLoaded, s.AccountUpdated, s.AccountDeleted = 0, 0, 0
+	s.StorageLoaded = 0
+	s.StorageUpdated.Store(0)
+	s.StorageDeleted.Store(0)
+
+	// Clear all internal flags and keep the root unchanged.
+	s.mutations = make(map[common.Address]*mutation)
+	s.stateObjectsDestruct = make(map[common.Address]*stateObject)
+
+	origin := s.originalRoot
+	root := s.originalRoot
+	s.originalRoot = root
+
+	return newStateUpdate(noStorageWiping, origin, root, blockNumber, deletes, updates, nil), nil
+}
+
 // commitAndFlush is a wrapper of commit which also commits the state mutations
 // to the configured data stores.
 func (s *StateDB) commitAndFlush(block uint64, deleteEmptyObjects bool, noStorageWiping bool, deriveCodeFields bool) (*stateUpdate, error) {
@@ -1376,6 +1458,10 @@ func (s *StateDB) commitAndFlush(block uint64, deleteEmptyObjects bool, noStorag
 		if err := ret.deriveCodeFields(s.reader); err != nil {
 			return nil, err
 		}
+	}
+	if s.db.ObservationMode() {
+		s.reader, _ = s.db.Reader(s.originalRoot)
+		return ret, nil
 	}
 	start := time.Now()
 	if err := s.db.Commit(ret); err != nil {
