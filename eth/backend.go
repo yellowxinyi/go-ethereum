@@ -247,6 +247,8 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		}
 	)
 	if config.SyncMode == ethconfig.SnapSync {
+		// Snap sync implies observation mode (flat-KV state, no MPT maintenance).
+		options.ObservationMode = true
 		options.SnapBodyKeepBlocks = 128
 	}
 	if config.VMTrace != "" {

@@ -63,6 +63,9 @@ type Database interface {
 
 	// Snapshot returns the underlying state snapshot.
 	Snapshot() *snapshot.Tree
+
+	// ObservationMode reports whether the database is in observation mode.
+	ObservationMode() bool
 }
 
 // Trie is a Ethereum Merkle Patricia trie.
@@ -160,6 +163,8 @@ type CachingDB struct {
 	codeCache     *lru.SizeConstrainedCache[common.Hash, []byte]
 	codeSizeCache *lru.Cache[common.Hash, int]
 	pointCache    *utils.PointCache
+	plainKV       ethdb.KeyValueReader // Optional plain-KV view for observation mode reads
+	observation   bool                 // Whether to read state from plain-KV instead of tries
 
 	// Transition-specific fields
 	TransitionStatePerRoot *lru.Cache[common.Hash, *overlay.TransitionState]
@@ -178,6 +183,13 @@ func NewDatabase(triedb *triedb.Database, snap *snapshot.Tree) *CachingDB {
 	}
 }
 
+// EnableObservationMode switches the state reader to use the plain-KV view.
+// This is intended for snap observation mode where MPT maintenance is disabled.
+func (db *CachingDB) EnableObservationMode(plainKV ethdb.KeyValueReader) {
+	db.plainKV = plainKV
+	db.observation = true
+}
+
 // NewDatabaseForTesting is similar to NewDatabase, but it initializes the caching
 // db by using an ephemeral memory db with default config for testing.
 func NewDatabaseForTesting() *CachingDB {
@@ -187,6 +199,13 @@ func NewDatabaseForTesting() *CachingDB {
 // Reader returns a state reader associated with the specified state root.
 func (db *CachingDB) Reader(stateRoot common.Hash) (Reader, error) {
 	var readers []StateReader
+
+	if db.observation {
+		if db.plainKV == nil {
+			return nil, fmt.Errorf("observation mode requires plain KV backend")
+		}
+		return newReader(newCachingCodeReader(db.disk, db.codeCache, db.codeSizeCache), newPlainReader(db.plainKV)), nil
+	}
 
 	// Configure the state reader using the standalone snapshot in hash mode.
 	// This reader offers improved performance but is optional and only
@@ -293,6 +312,11 @@ func (db *CachingDB) PointCache() *utils.PointCache {
 // Snapshot returns the underlying state snapshot.
 func (db *CachingDB) Snapshot() *snapshot.Tree {
 	return db.snap
+}
+
+// ObservationMode reports whether the database is in observation mode.
+func (db *CachingDB) ObservationMode() bool {
+	return db.observation
 }
 
 // mustCopyTrie returns a deep-copied trie.

@@ -153,3 +153,8 @@ func (db *HistoricDB) TrieDB() *triedb.Database {
 func (db *HistoricDB) Snapshot() *snapshot.Tree {
 	return nil
 }
+
+// ObservationMode reports whether the database is in observation mode.
+func (db *HistoricDB) ObservationMode() bool {
+	return false
+}

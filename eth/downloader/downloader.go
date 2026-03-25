@@ -28,6 +28,7 @@ import (
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
+	"github.com/ethereum/go-ethereum/core/state/roothash"
 	"github.com/ethereum/go-ethereum/core/state/snapshot"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/eth/ethconfig"
@@ -224,6 +225,9 @@ type BlockChain interface {
 	// with trie nodes.
 	TrieDB() *triedb.Database
 
+	// ObservationMode reports whether the chain runs in observation mode.
+	ObservationMode() bool
+
 	// HistoryPruningCutoff returns the configured history pruning point.
 	// Block bodies along with the receipts will be skipped for synchronization.
 	HistoryPruningCutoff() (uint64, common.Hash)
@@ -243,7 +247,7 @@ func New(stateDb ethdb.Database, mux *event.TypeMux, chain BlockChain, dropPeer 
 		dropPeer:          dropPeer,
 		headerProcCh:      make(chan *headerTask, 1),
 		quitCh:            make(chan struct{}),
-		SnapSyncer:        snap.NewSyncer(stateDb, chain.TrieDB().Scheme()),
+		SnapSyncer:        snap.NewSyncer(stateDb, chain.TrieDB().Scheme(), chain.ObservationMode()),
 		stateSyncStart:    make(chan *stateSync),
 		syncStartBlock:    chain.CurrentSnapBlock().Number.Uint64(),
 	}
@@ -1001,6 +1005,15 @@ func (d *Downloader) processSnapSyncContent() error {
 			case <-sync.done:
 				if sync.err != nil {
 					return sync.err
+				}
+				if d.blockchain.ObservationMode() {
+					computed, err := roothash.ComputeHashedStateRoot(d.stateDB)
+					if err != nil {
+						return err
+					}
+					if computed != P.Header.Root {
+						return fmt.Errorf("pivot state root mismatch (remote: %x local: %x)", P.Header.Root, computed)
+					}
 				}
 				if err := d.commitPivotBlock(P); err != nil {
 					return err

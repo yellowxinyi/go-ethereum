@@ -51,6 +51,8 @@ type accountUpdate struct {
 	origin   []byte                 // origin is the original value of account data in slim-RLP encoding.
 	code     *contractCode          // code represents mutated contract code; nil means it's not modified.
 	storages map[common.Hash][]byte // storages stores mutated slots in prefix-zero-trimmed RLP format.
+	// storagesByKey stores mutated slots keyed by the raw storage key.
+	storagesByKey map[common.Hash][]byte
 
 	// storagesOriginByKey and storagesOriginByHash both store the original values
 	// of mutated slots in prefix-zero-trimmed RLP format. The difference is that

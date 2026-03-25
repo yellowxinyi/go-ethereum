@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
@@ -400,6 +401,10 @@ func (s *stateObject) commitStorage(op *accountUpdate) {
 			op.storages = make(map[common.Hash][]byte)
 		}
 		op.storages[hash] = encode(val)
+		if op.storagesByKey == nil {
+			op.storagesByKey = make(map[common.Hash][]byte)
+		}
+		op.storagesByKey[key] = encode(val)
 
 		if op.storagesOriginByKey == nil {
 			op.storagesOriginByKey = make(map[common.Hash][]byte)
@@ -441,6 +446,43 @@ func (s *stateObject) commit() (*accountUpdate, *trienode.NodeSet, error) {
 	}
 	// Commit storage changes and the associated storage trie
 	s.commitStorage(op)
+	if s.db.Database().ObservationMode() {
+		disk := s.db.Database().TrieDB().Disk()
+		if disk != nil {
+			batch := disk.NewBatch()
+			plainIncarnation, hasPlainInc := rawdb.ReadPlainIncarnation(disk, s.address)
+			hashedIncarnation, hasHashedInc := rawdb.ReadHashedIncarnation(disk, s.addrHash)
+			if !hasPlainInc {
+				rawdb.WritePlainIncarnation(batch, s.address, 0)
+				plainIncarnation = 0
+			}
+			if !hasHashedInc {
+				rawdb.WriteHashedIncarnation(batch, s.addrHash, 0)
+				hashedIncarnation = 0
+			}
+			accountRLP, err := rlp.EncodeToBytes(s.data)
+			if err != nil {
+				return nil, nil, err
+			}
+			rawdb.WritePlainAccount(batch, s.address, accountRLP)
+			rawdb.WriteHashedAccount(batch, s.addrHash, accountRLP)
+			for key, encoded := range op.storagesByKey {
+				slotHash := crypto.Keccak256Hash(key.Bytes())
+				if len(encoded) == 0 {
+					rawdb.DeletePlainStorage(batch, s.address, plainIncarnation, key)
+					rawdb.DeleteHashedStorage(batch, s.addrHash, hashedIncarnation, slotHash)
+					continue
+				}
+				rawdb.WritePlainStorage(batch, s.address, plainIncarnation, key, encoded)
+				rawdb.WriteHashedStorage(batch, s.addrHash, hashedIncarnation, slotHash, encoded)
+			}
+			if err := batch.Write(); err != nil {
+				return nil, nil, err
+			}
+		}
+		s.origin = s.data.Copy()
+		return op, nil, nil
+	}
 	if len(op.storages) == 0 {
 		// nothing changed, don't bother to commit the trie
 		s.origin = s.data.Copy()

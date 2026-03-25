@@ -120,6 +120,19 @@ var (
 	CodePrefix            = []byte("c") // CodePrefix + code hash -> account code
 	skeletonHeaderPrefix  = []byte("S") // skeletonHeaderPrefix + num (uint64 big endian) -> header
 
+	// Plain state storage prefixes (observation mode)
+	PlainAccountPrefix = []byte("pA") // PlainAccountPrefix + address -> RLP(StateAccount)
+	PlainStoragePrefix = []byte("pO") // PlainStoragePrefix + address + incarnation + slot -> storage value
+
+	// Hashed state storage prefixes (observation mode)
+	HashedAccountPrefix = []byte("hA") // HashedAccountPrefix + account hash -> RLP(StateAccount)
+	HashedStoragePrefix = []byte("hO") // HashedStoragePrefix + account hash + incarnation + storage hash -> storage value
+
+	// Flat state storage prefixes (deprecated; kept for compatibility with earlier patches)
+	FlatAccountPrefix = HashedAccountPrefix
+	FlatStoragePrefix = HashedStoragePrefix
+	FlatStateMetaPrefix = []byte("fM") // FlatStateMetaPrefix + key -> metadata (pivot root, flags)
+
 	// Path-based storage scheme of merkle patricia trie.
 	TrieNodeAccountPrefix = []byte("A") // TrieNodeAccountPrefix + hexPath -> trie node
 	TrieNodeStoragePrefix = []byte("O") // TrieNodeStoragePrefix + accountHash + hexPath -> trie node

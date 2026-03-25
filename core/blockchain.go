@@ -199,6 +199,9 @@ type BlockChainConfig struct {
 	// StateSizeTracking indicates whether the state size tracking is enabled.
 	StateSizeTracking bool
 
+	// ObservationMode enables flat-KV state usage and disables MPT maintenance.
+	ObservationMode bool
+
 	// SnapBodyKeepBlocks keeps only the latest N block bodies when snap sync is used.
 	// Zero disables body pruning.
 	SnapBodyKeepBlocks uint64
@@ -396,6 +399,10 @@ func NewBlockChain(db ethdb.Database, genesis *Genesis, engine consensus.Engine,
 	}
 	bc.flushInterval.Store(int64(cfg.TrieTimeLimit))
 	bc.statedb = state.NewDatabase(bc.triedb, nil)
+	if bc.cfg.ObservationMode {
+		// Observation mode reads state from plain-KV and does not rely on tries.
+		bc.statedb.EnableObservationMode(bc.db)
+	}
 	bc.validator = NewBlockValidator(chainConfig, bc)
 	bc.prefetcher = newStatePrefetcher(chainConfig, bc.hc)
 	bc.processor = NewStateProcessor(bc.hc)
@@ -575,6 +582,10 @@ func (bc *BlockChain) setupSnapshot() {
 
 		// Re-initialize the state database with snapshot
 		bc.statedb = state.NewDatabase(bc.triedb, bc.snaps)
+		if bc.cfg.ObservationMode {
+			// Observation mode reads state from plain-KV and does not rely on tries.
+			bc.statedb.EnableObservationMode(bc.db)
+		}
 	}
 }
 
@@ -1633,6 +1644,9 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 	// Emit the state update to the state sizestats if it's active
 	if bc.stateSizer != nil {
 		bc.stateSizer.Notify(stateUpdate)
+	}
+	if bc.cfg.ObservationMode {
+		return nil
 	}
 	// If node is running in path mode, skip explicit gc operation
 	// which is unnecessary in this mode.
