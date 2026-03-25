@@ -444,6 +444,7 @@ type SyncPeer interface {
 type Syncer struct {
 	db     ethdb.KeyValueStore // Database to store the trie nodes into (and dedup)
 	scheme string              // Node scheme used in node database
+	observation bool           // Whether to run in observation mode (no trie healing)
 
 	root    common.Hash    // Current state trie root being synced
 	tasks   []*accountTask // Current account task set being synced
@@ -513,10 +514,11 @@ type Syncer struct {
 
 // NewSyncer creates a new snapshot syncer to download the Ethereum state over the
 // snap protocol.
-func NewSyncer(db ethdb.KeyValueStore, scheme string) *Syncer {
+func NewSyncer(db ethdb.KeyValueStore, scheme string, observation bool) *Syncer {
 	return &Syncer{
 		db:     db,
 		scheme: scheme,
+		observation: observation,
 
 		peers:    make(map[string]SyncPeer),
 		peerJoin: new(event.Feed),
@@ -609,8 +611,12 @@ func (s *Syncer) Sync(root common.Hash, cancel chan struct{}) error {
 	// any peers and initialize the syncer if it was not yet run
 	s.lock.Lock()
 	s.root = root
+	var scheduler *trie.Sync
+	if !s.observation {
+		scheduler = state.NewStateSync(root, s.db, s.onHealState, s.scheme)
+	}
 	s.healer = &healTask{
-		scheduler: state.NewStateSync(root, s.db, s.onHealState, s.scheme),
+		scheduler: scheduler,
 		trieTasks: make(map[string]common.Hash),
 		codeTasks: make(map[common.Hash]struct{}),
 	}
@@ -622,7 +628,7 @@ func (s *Syncer) Sync(root common.Hash, cancel chan struct{}) error {
 	}
 	// Retrieve the previous sync status from LevelDB and abort if already synced
 	s.loadSyncStatus()
-	if len(s.tasks) == 0 && s.healer.scheduler.Pending() == 0 {
+	if len(s.tasks) == 0 && s.healerPending() == 0 {
 		log.Debug("Snapshot sync already completed")
 		return nil
 	}
@@ -686,7 +692,7 @@ func (s *Syncer) Sync(root common.Hash, cancel chan struct{}) error {
 		// Remove all completed tasks and terminate sync if everything's done
 		s.cleanStorageTasks()
 		s.cleanAccountTasks()
-		if len(s.tasks) == 0 && s.healer.scheduler.Pending() == 0 {
+		if len(s.tasks) == 0 && s.healerPending() == 0 {
 			// State healing phase completed, record the elapsed time in metrics.
 			// Note: healing may be rerun in subsequent cycles to fill gaps between
 			// pivot states (e.g., if chain sync takes longer).
@@ -714,8 +720,10 @@ func (s *Syncer) Sync(root common.Hash, cancel chan struct{}) error {
 			if s.healStartTime.IsZero() {
 				s.healStartTime = time.Now()
 			}
-			s.assignTrienodeHealTasks(trienodeHealResps, trienodeHealReqFails, cancel)
-			s.assignBytecodeHealTasks(bytecodeHealResps, bytecodeHealReqFails, cancel)
+			if !s.observation {
+				s.assignTrienodeHealTasks(trienodeHealResps, trienodeHealReqFails, cancel)
+				s.assignBytecodeHealTasks(bytecodeHealResps, bytecodeHealReqFails, cancel)
+			}
 		}
 		// Update sync progress
 		s.lock.Lock()
@@ -951,6 +959,13 @@ func (s *Syncer) Progress() (*SyncProgress, *SyncPending) {
 		pending.BytecodeHeal = uint64(len(s.healer.codeTasks))
 	}
 	return s.extProgress, pending
+}
+
+func (s *Syncer) healerPending() int {
+	if s.healer == nil || s.healer.scheduler == nil {
+		return 0
+	}
+	return s.healer.scheduler.Pending()
 }
 
 // cleanAccountTasks removes account range retrieval tasks that have already been
@@ -1375,6 +1390,9 @@ func (s *Syncer) assignStorageTasks(success chan *storageResponse, fail chan *st
 // assignTrienodeHealTasks attempts to match idle peers to trie node requests to
 // heal any trie errors caused by the snap sync's chunked retrieval model.
 func (s *Syncer) assignTrienodeHealTasks(success chan *trienodeHealResponse, fail chan *trienodeHealRequest, cancel chan struct{}) {
+	if s.healer == nil || s.healer.scheduler == nil {
+		return
+	}
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
@@ -1503,6 +1521,9 @@ func (s *Syncer) assignTrienodeHealTasks(success chan *trienodeHealResponse, fai
 // assignBytecodeHealTasks attempts to match idle peers to bytecode requests to
 // heal any trie errors caused by the snap sync's chunked retrieval model.
 func (s *Syncer) assignBytecodeHealTasks(success chan *bytecodeHealResponse, fail chan *bytecodeHealRequest, cancel chan struct{}) {
+	if s.healer == nil || s.healer.scheduler == nil {
+		return
+	}
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
@@ -1901,7 +1922,8 @@ func (s *Syncer) revertBytecodeHealRequest(req *bytecodeHealRequest) {
 }
 
 // processAccountResponse integrates an already validated account range response
-// into the account tasks.
+// into the account tasks. In observation mode, only hashed state is persisted
+// and trie healing is disabled (plain state is filled during execution).
 func (s *Syncer) processAccountResponse(res *accountResponse) {
 	// Switch the task from pending to filling
 	res.task.req = nil
@@ -1959,7 +1981,7 @@ func (s *Syncer) processAccountResponse(res *accountResponse) {
 				}
 				// Mark the healing tag if storage root node is inconsistent, or
 				// it's non-existent due to storage chunking.
-				if !rawdb.HasTrieNode(s.db, res.hashes[i], nil, account.Root, s.scheme) {
+				if !s.observation && !rawdb.HasTrieNode(s.db, res.hashes[i], nil, account.Root, s.scheme) {
 					res.task.needHeal[i] = true
 				}
 			} else {
@@ -1972,7 +1994,9 @@ func (s *Syncer) processAccountResponse(res *accountResponse) {
 					for _, subtask := range subtasks {
 						subtask.root = account.Root
 					}
-					res.task.needHeal[i] = true
+					if !s.observation {
+						res.task.needHeal[i] = true
+					}
 					resumed[res.hashes[i]] = struct{}{}
 					largeStorageResumedGauge.Inc(1)
 				} else {
@@ -2067,7 +2091,8 @@ func (s *Syncer) processBytecodeResponse(res *bytecodeResponse) {
 }
 
 // processStorageResponse integrates an already validated storage response
-// into the account tasks.
+// into the account tasks. In observation mode, only hashed state is persisted
+// and trie healing is disabled (plain state is filled during execution).
 func (s *Syncer) processStorageResponse(res *storageResponse) {
 	// Switch the subtask from pending to idle
 	if res.subTask != nil {
@@ -2111,7 +2136,9 @@ func (s *Syncer) processStorageResponse(res *storageResponse) {
 			// If the last contract was chunked, mark it as needing healing
 			// to avoid writing it out to disk prematurely.
 			if res.subTask == nil && !res.mainTask.needHeal[j] && i == len(res.hashes)-1 && res.cont {
-				res.mainTask.needHeal[j] = true
+				if !s.observation {
+					res.mainTask.needHeal[j] = true
+				}
 			}
 			// If the last contract was chunked, we need to switch to large
 			// contract handling mode
@@ -2155,12 +2182,14 @@ func (s *Syncer) processStorageResponse(res *storageResponse) {
 						},
 					}
 					var tr genTrie
-					if s.scheme == rawdb.HashScheme {
-						tr = newHashTrie(batch)
-					}
-					if s.scheme == rawdb.PathScheme {
-						// Keep the left boundary as it's the first range.
-						tr = newPathTrie(account, false, s.db, batch)
+					if !s.observation {
+						if s.scheme == rawdb.HashScheme {
+							tr = newHashTrie(batch)
+						}
+						if s.scheme == rawdb.PathScheme {
+							// Keep the left boundary as it's the first range.
+							tr = newPathTrie(account, false, s.db, batch)
+						}
 					}
 					tasks = append(tasks, &storageTask{
 						Next:     common.Hash{},
@@ -2177,11 +2206,13 @@ func (s *Syncer) processStorageResponse(res *storageResponse) {
 							},
 						}
 						var tr genTrie
-						if s.scheme == rawdb.HashScheme {
-							tr = newHashTrie(batch)
-						}
-						if s.scheme == rawdb.PathScheme {
-							tr = newPathTrie(account, true, s.db, batch)
+						if !s.observation {
+							if s.scheme == rawdb.HashScheme {
+								tr = newHashTrie(batch)
+							}
+							if s.scheme == rawdb.PathScheme {
+								tr = newPathTrie(account, true, s.db, batch)
+							}
 						}
 						tasks = append(tasks, &storageTask{
 							Next:     r.Start(),
@@ -2231,37 +2262,52 @@ func (s *Syncer) processStorageResponse(res *storageResponse) {
 		// push them to disk. If the contract is chunked, the trie nodes will be
 		// reconstructed later.
 		slots += len(res.hashes[i])
+		var hashedIncarnation uint64
+		if s.observation {
+			var ok bool
+			hashedIncarnation, ok = rawdb.ReadHashedIncarnation(s.db, account)
+			if !ok {
+				rawdb.WriteHashedIncarnation(batch, account, 0)
+				hashedIncarnation = 0
+			}
+		}
 
-		if i < len(res.hashes)-1 || res.subTask == nil {
-			// no need to make local reassignment of account: this closure does not outlive the loop
-			var tr genTrie
-			if s.scheme == rawdb.HashScheme {
-				tr = newHashTrie(batch)
+		if !s.observation {
+			if i < len(res.hashes)-1 || res.subTask == nil {
+				// no need to make local reassignment of account: this closure does not outlive the loop
+				var tr genTrie
+				if s.scheme == rawdb.HashScheme {
+					tr = newHashTrie(batch)
+				}
+				if s.scheme == rawdb.PathScheme {
+					// Keep the left boundary as it's complete
+					tr = newPathTrie(account, false, s.db, batch)
+				}
+				for j := 0; j < len(res.hashes[i]); j++ {
+					tr.update(res.hashes[i][j][:], res.slots[i][j])
+				}
+				tr.commit(true)
 			}
-			if s.scheme == rawdb.PathScheme {
-				// Keep the left boundary as it's complete
-				tr = newPathTrie(account, false, s.db, batch)
-			}
-			for j := 0; j < len(res.hashes[i]); j++ {
-				tr.update(res.hashes[i][j][:], res.slots[i][j])
-			}
-			tr.commit(true)
 		}
 		// Persist the received storage segments. These flat state maybe
 		// outdated during the sync, but it can be fixed later during the
 		// snapshot generation.
 		for j := 0; j < len(res.hashes[i]); j++ {
-			rawdb.WriteStorageSnapshot(batch, account, res.hashes[i][j], res.slots[i][j])
+			if s.observation {
+				rawdb.WriteHashedStorage(batch, account, hashedIncarnation, res.hashes[i][j], res.slots[i][j])
+			} else {
+				rawdb.WriteStorageSnapshot(batch, account, res.hashes[i][j], res.slots[i][j])
+			}
 
 			// If we're storing large contracts, generate the trie nodes
 			// on the fly to not trash the gluing points
-			if i == len(res.hashes)-1 && res.subTask != nil {
+			if !s.observation && i == len(res.hashes)-1 && res.subTask != nil {
 				res.subTask.genTrie.update(res.hashes[i][j][:], res.slots[i][j])
 			}
 		}
 	}
 	// Large contracts could have generated new trie nodes, flush them to disk
-	if res.subTask != nil {
+	if res.subTask != nil && !s.observation {
 		if res.subTask.done {
 			root := res.subTask.genTrie.commit(res.subTask.Last == common.MaxHash)
 			if err := res.subTask.genBatch.Write(); err != nil {
@@ -2309,6 +2355,9 @@ func (s *Syncer) processStorageResponse(res *storageResponse) {
 // processTrienodeHealResponse integrates an already validated trienode response
 // into the healer tasks.
 func (s *Syncer) processTrienodeHealResponse(res *trienodeHealResponse) {
+	if s.healer == nil || s.healer.scheduler == nil {
+		return
+	}
 	var (
 		start = time.Now()
 		fills int
@@ -2386,6 +2435,9 @@ func (s *Syncer) processTrienodeHealResponse(res *trienodeHealResponse) {
 }
 
 func (s *Syncer) commitHealer(force bool) {
+	if s.healer == nil || s.healer.scheduler == nil {
+		return
+	}
 	if !force && s.healer.scheduler.MemSize() < ethdb.IdealBatchSize {
 		return
 	}
@@ -2402,6 +2454,9 @@ func (s *Syncer) commitHealer(force bool) {
 // processBytecodeHealResponse integrates an already validated bytecode response
 // into the healer tasks.
 func (s *Syncer) processBytecodeHealResponse(res *bytecodeHealResponse) {
+	if s.healer == nil || s.healer.scheduler == nil {
+		return
+	}
 	for i, hash := range res.hashes {
 		node := res.codes[i]
 
@@ -2454,6 +2509,17 @@ func (s *Syncer) forwardAccountTask(task *accountTask) {
 		if task.needCode[i] || task.needState[i] {
 			break
 		}
+		if s.observation {
+			rlpAccount, err := rlp.EncodeToBytes(res.accounts[i])
+			if err != nil {
+				panic(err) // Should never happen for StateAccount
+			}
+			rawdb.WriteHashedAccount(batch, hash, rlpAccount)
+			if _, ok := rawdb.ReadHashedIncarnation(s.db, hash); !ok {
+				rawdb.WriteHashedIncarnation(batch, hash, 0)
+			}
+			continue
+		}
 		slim := types.SlimAccountRLP(*res.accounts[i])
 		rawdb.WriteAccountSnapshot(batch, hash, slim)
 
@@ -2504,17 +2570,21 @@ func (s *Syncer) forwardAccountTask(task *accountTask) {
 	// flush after finalizing task.done. It's fine even if we crash and lose this
 	// write as it will only cause more data to be downloaded during heal.
 	if task.done {
-		task.genTrie.commit(task.Last == common.MaxHash)
-		if err := task.genBatch.Write(); err != nil {
-			log.Error("Failed to persist stack account", "err", err)
+		if !s.observation {
+			task.genTrie.commit(task.Last == common.MaxHash)
+			if err := task.genBatch.Write(); err != nil {
+				log.Error("Failed to persist stack account", "err", err)
+			}
+			task.genBatch.Reset()
 		}
-		task.genBatch.Reset()
 	} else if task.genBatch.ValueSize() > batchSizeThreshold {
-		task.genTrie.commit(false)
-		if err := task.genBatch.Write(); err != nil {
-			log.Error("Failed to persist stack account", "err", err)
+		if !s.observation {
+			task.genTrie.commit(false)
+			if err := task.genBatch.Write(); err != nil {
+				log.Error("Failed to persist stack account", "err", err)
+			}
+			task.genBatch.Reset()
 		}
-		task.genBatch.Reset()
 	}
 	log.Debug("Persisted range of accounts", "accounts", len(res.accounts), "bytes", s.accountBytes-oldAccountBytes)
 }
@@ -2882,6 +2952,9 @@ func (s *Syncer) OnStorage(peer SyncPeer, id uint64, hashes [][]common.Hash, slo
 // OnTrieNodes is a callback method to invoke when a batch of trie nodes
 // are received from a remote peer.
 func (s *Syncer) OnTrieNodes(peer SyncPeer, id uint64, trienodes [][]byte) error {
+	if s.observation {
+		return nil
+	}
 	var size common.StorageSize
 	for _, node := range trienodes {
 		size += common.StorageSize(len(node))
@@ -3089,6 +3162,34 @@ func (s *Syncer) onHealByteCodes(peer SyncPeer, id uint64, bytecodes [][]byte) e
 // can be persisted blindly and can be fixed later in the generation stage.
 // Note it's not concurrent safe, please handle the concurrent issue outside.
 func (s *Syncer) onHealState(paths [][]byte, value []byte) error {
+	if s.observation {
+		if len(paths) == 1 {
+			accountHash := common.BytesToHash(paths[0])
+			rawdb.WriteHashedAccount(s.stateWriter, accountHash, value)
+			if _, ok := rawdb.ReadHashedIncarnation(s.db, accountHash); !ok {
+				rawdb.WriteHashedIncarnation(s.stateWriter, accountHash, 0)
+			}
+			s.accountHealed += 1
+			s.accountHealedBytes += common.StorageSize(1 + common.HashLength + len(value))
+		}
+		if len(paths) == 2 {
+			accountHash := common.BytesToHash(paths[0])
+			storageHash := common.BytesToHash(paths[1])
+			incarnation, ok := rawdb.ReadHashedIncarnation(s.db, accountHash)
+			if !ok {
+				incarnation = 0
+				rawdb.WriteHashedIncarnation(s.stateWriter, accountHash, 0)
+			}
+			rawdb.WriteHashedStorage(s.stateWriter, accountHash, incarnation, storageHash, value)
+			s.storageHealed += 1
+			s.storageHealedBytes += common.StorageSize(1 + 2*common.HashLength + len(value))
+		}
+		if s.stateWriter.ValueSize() > ethdb.IdealBatchSize {
+			s.stateWriter.Write()
+			s.stateWriter.Reset()
+		}
+		return nil
+	}
 	if len(paths) == 1 {
 		var account types.StateAccount
 		if err := rlp.DecodeBytes(value, &account); err != nil {
@@ -3185,7 +3286,7 @@ func (s *Syncer) reportHealProgress(force bool) {
 		storage  = fmt.Sprintf("%v@%v", log.FormatLogfmtUint64(s.storageHealed), s.storageHealedBytes.TerminalString())
 	)
 	log.Info("Syncing: state healing in progress", "accounts", accounts, "slots", storage,
-		"codes", bytecode, "nodes", trienode, "pending", s.healer.scheduler.Pending())
+		"codes", bytecode, "nodes", trienode, "pending", s.healerPending())
 }
 
 // estimateRemainingSlots tries to determine roughly how many slots are left in

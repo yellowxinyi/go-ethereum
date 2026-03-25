@@ -386,6 +386,9 @@ func (api *BlockChainAPI) GetProof(ctx context.Context, address common.Address, 
 	if statedb == nil || err != nil {
 		return nil, err
 	}
+	if statedb.Database().ObservationMode() {
+		return nil, errors.New("eth_getProof is not supported in observation mode")
+	}
 	codeHash := statedb.GetCodeHash(address)
 	storageRoot := statedb.GetStorageRoot(address)
 

@@ -91,6 +91,9 @@ type Config struct {
 	// zero, the chain ID is used as network ID.
 	NetworkId uint64
 	SyncMode  SyncMode
+	// ObservationMode enables flat-KV state storage and disables MPT maintenance.
+	// It is intended to be set internally when snap sync is used.
+	ObservationMode bool `toml:"-"`
 
 	// HistoryMode configures chain history retention.
 	HistoryMode history.HistoryMode
