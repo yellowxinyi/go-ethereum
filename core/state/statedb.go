@@ -1400,6 +1400,15 @@ func (s *StateDB) commitAndFlush(block uint64, deleteEmptyObjects bool, noStorag
 		return nil, err
 	}
 	if s.db.ObservationMode() {
+		if db := s.db.TrieDB().Disk(); db != nil && len(ret.codes) > 0 {
+			batch := db.NewBatch()
+			for _, code := range ret.codes {
+				rawdb.WriteCode(batch, code.hash, code.blob)
+			}
+			if err := batch.Write(); err != nil {
+				return nil, err
+			}
+		}
 		s.reader, _ = s.db.Reader(s.originalRoot)
 		return ret, nil
 	}

@@ -173,7 +173,8 @@ func (bc *BlockChain) HasFastBlock(hash common.Hash, number uint64) bool {
 }
 
 // GetBlock retrieves a block from the database by hash and number,
-// caching it if found.
+// caching it if found. In snap observation mode, a header-only block is
+// returned with an empty transactions list when the body is pruned.
 func (bc *BlockChain) GetBlock(hash common.Hash, number uint64) *types.Block {
 	// Short circuit if the block's already in the cache, retrieve otherwise
 	if block, ok := bc.blockCache.Get(hash); ok {
