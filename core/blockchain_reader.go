@@ -428,6 +428,13 @@ func (bc *BlockChain) State() (*state.StateDB, error) {
 
 // StateAt returns a new mutable state based on a particular point in time.
 func (bc *BlockChain) StateAt(root common.Hash) (*state.StateDB, error) {
+	if bc.cfg.ObservationMode {
+		head := bc.CurrentBlock()
+		if head != nil && root != head.Root {
+			return nil, errors.New("historic state is not available in observation mode")
+		}
+		return state.New(root, bc.statedb)
+	}
 	return state.New(root, state.NewDatabase(bc.triedb, bc.codedb).WithSnapshot(bc.snaps))
 }
 
