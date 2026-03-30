@@ -1554,12 +1554,17 @@ func (bc *BlockChain) InsertReceiptChain(blockChain types.Blocks, receiptChain [
 			if bc.insertStopped() {
 				return 0, errInsertionInterrupted
 			}
-			if !skipPresenceCheck {
-				// Ignore if the entire data is already known
-				if bc.HasBlock(block.Hash(), block.NumberU64()) {
-					stats.ignored++
-					continue
-				} else {
+				if !skipPresenceCheck {
+					// Ignore if the entire data is already known
+					if bc.cfg.SnapBodyKeepBlocks > 0 {
+						if rawdb.HasReceipts(bc.db, block.Hash(), block.NumberU64()) {
+							stats.ignored++
+							continue
+						}
+					} else if bc.HasBlock(block.Hash(), block.NumberU64()) {
+						stats.ignored++
+						continue
+					} else {
 					// If block N is not present, neither are the later blocks.
 					// This should be true, but if we are mistaken, the shortcut
 					// here will only cause overwriting of some existing data
