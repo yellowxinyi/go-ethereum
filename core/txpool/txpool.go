@@ -17,18 +17,24 @@
 package txpool
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"math/big"
+	"os"
 	"sync"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/lru"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/ethdb/pebble"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/rlp"
 )
 
 // TxStatus is the current status of a transaction as seen by the pool.
@@ -40,6 +46,14 @@ const (
 	TxStatusPending
 	TxStatusIncluded
 )
+
+// txPoolObservation asynchronously
+// txpool snapshot
+type txPoolObservation struct {
+	blockNumber uint64
+	pending     map[common.Address][]*types.Transaction
+	queue       map[common.Address][]*types.Transaction
+}
 
 // BlockChain defines the minimal set of methods needed to back a tx pool with
 // a chain. Exists to allow mocking the live chain out of tests.
@@ -74,6 +88,10 @@ type TxPool struct {
 	term chan struct{}           // Termination channel to detect a closed pool
 
 	sync chan chan error // Testing / simulator channel to block until internal reset is done
+
+	db              ethdb.KeyValueStore     // add for KVdatabase
+	observationChan chan *txPoolObservation // add for Channel
+	observationQuit chan struct{}
 }
 
 // New creates a new transaction pool to gather, sort and filter inbound
@@ -84,6 +102,12 @@ func New(gasTip uint64, chain BlockChain, subpools []SubPool) (*TxPool, error) {
 	// during initialization.
 	head := chain.CurrentBlock()
 
+	// (cache, handles, namespace, readonly)
+	db, err := pebble.New("kvdb", 1024, 1024, "", false)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open leveldb: %w", err)
+	}
+
 	// Initialize the state with head block, or fallback to empty one in
 	// case the head state is not available (might occur when node is not
 	// fully synced).
@@ -92,8 +116,12 @@ func New(gasTip uint64, chain BlockChain, subpools []SubPool) (*TxPool, error) {
 		statedb, err = chain.StateAt(types.EmptyRootHash)
 	}
 	if err != nil {
+		// leveldb
+		db.Close() // close database when worse
+		// leveldb
 		return nil, err
 	}
+
 	pool := &TxPool{
 		subpools: subpools,
 		chain:    chain,
@@ -101,6 +129,11 @@ func New(gasTip uint64, chain BlockChain, subpools []SubPool) (*TxPool, error) {
 		quit:     make(chan chan error),
 		term:     make(chan struct{}),
 		sync:     make(chan chan error),
+
+		// leveldb
+		db:              db,
+		observationChan: make(chan *txPoolObservation, 64),
+		observationQuit: make(chan struct{}),
 	}
 	reserver := NewReservationTracker()
 	for i, subpool := range subpools {
@@ -108,11 +141,73 @@ func New(gasTip uint64, chain BlockChain, subpools []SubPool) (*TxPool, error) {
 			for j := i - 1; j >= 0; j-- {
 				subpools[j].Close()
 			}
+			// leveldb
+			db.Close()
+			// leveldb
 			return nil, err
 		}
 	}
+	// leveldb
+	go pool.observationWorker()
+	// leveldb
 	go pool.loop(head)
 	return pool, nil
+}
+
+// leveldb
+
+func (p *TxPool) observationWorker() {
+	defer close(p.observationQuit)
+
+	file, err := os.OpenFile("txhash.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		panic(err)
+	}
+	defer file.Close()
+	writer := bufio.NewWriter(file)
+	defer writer.Flush()
+
+	cache := lru.NewBasicLRU[common.Hash, struct{}](10000)
+
+	// Loop and read data from the channel until p.Close() closes it
+	for data := range p.observationChan {
+		blockNum := data.blockNumber
+		log.Info("Observation worker processing snapshot", "num", blockNum)
+		// 1.LevelDB Batch Writer
+		batch := p.db.NewBatch()
+		txCount := 0
+		// 2.Text File Logic (bufio.Writer)
+		// Get the global writer
+		if _, err = fmt.Fprintln(writer, blockNum); err != nil {
+			panic(err)
+		}
+
+		for _, pool := range []map[common.Address][]*types.Transaction{data.pending, data.queue} {
+			for _, txs := range pool {
+				for _, tx := range txs {
+					if !cache.Contains(tx.Hash()) {
+						txBytes, err := rlp.EncodeToBytes(tx)
+						if err != nil {
+							panic(err)
+						}
+						if err = batch.Put(tx.Hash().Bytes(), txBytes); err != nil {
+							panic(err)
+						}
+						cache.Add(tx.Hash(), struct{}{})
+						txCount++
+					}
+					if _, err = fmt.Fprintln(writer, tx.Hash()); err != nil {
+						panic(err)
+					}
+				}
+			}
+		}
+		if err := batch.Write(); err != nil {
+			log.Error("Failed to apply KV batch", "err", err)
+		}
+
+		log.Info("Observation worker finished snapshot", "txCount", txCount)
+	}
 }
 
 // Close terminates the transaction pool and all its subpools.
@@ -125,6 +220,17 @@ func (p *TxPool) Close() error {
 	if err := <-errc; err != nil {
 		errs = append(errs, err)
 	}
+
+	// leveldb
+	// 1. close observation channel
+	close(p.observationChan)
+	<-p.observationQuit
+
+	// 3. close database
+	if err := p.db.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("failed to close leveldb: %w", err))
+	}
+
 	// Terminate each subpool
 	for _, subpool := range p.subpools {
 		if err := subpool.Close(); err != nil {
@@ -195,6 +301,24 @@ func (p *TxPool) loop(head *types.Header) {
 
 				// Busy marker injected, start a new subpool reset
 				go func(oldHead, newHead *types.Header) {
+					// 1. Get all transaction pool content (before Reset)
+					pending, queue := p.Content()
+
+					// 2. Create the observation data structure
+					data := &txPoolObservation{
+						blockNumber: newHead.Number.Uint64(),
+						pending:     pending,
+						queue:       queue,
+					}
+
+					// 3. data into the Channel
+					select {
+					case p.observationChan <- data:
+					default:
+						// Channel is full
+						panic(fmt.Errorf("TxPool observation channel full, skipping snapshot, block %s", newHead.Hash().Hex()))
+					}
+
 					for _, subpool := range p.subpools {
 						subpool.Reset(oldHead, newHead)
 					}
