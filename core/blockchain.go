@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"os"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"sort"
@@ -315,6 +317,8 @@ type BlockChain struct {
 	blockProcCounter int32
 	scope            event.SubscriptionScope
 	genesisBlock     *types.Block
+	blockPebbleChan  chan *types.Block
+	blockPebbleQuit  chan struct{}
 
 	// This mutex synchronizes chain write operations.
 	// Readers don't need to take it, they can just read the database.
@@ -377,6 +381,11 @@ func NewBlockChain(db ethdb.Database, genesis *Genesis, engine consensus.Engine,
 	}
 	log.Info(strings.Repeat("-", 153))
 	log.Info("")
+	blockOutDir := "blocks"
+	if err := os.MkdirAll(blockOutDir, 0755); err != nil {
+		triedb.Close()
+		return nil, fmt.Errorf("failed to create block output directory: %w", err)
+	}
 
 	bc := &BlockChain{
 		chainConfig:   chainConfig,
@@ -392,6 +401,8 @@ func NewBlockChain(db ethdb.Database, genesis *Genesis, engine consensus.Engine,
 		txLookupCache: lru.NewCache[common.Hash, txLookup](txLookupCacheLimit),
 		engine:        engine,
 		logger:        cfg.VmConfig.Tracer,
+		blockPebbleChan: make(chan *types.Block, 64),
+		blockPebbleQuit: make(chan struct{}),
 	}
 	bc.hc, err = NewHeaderChain(db, chainConfig, engine, bc.insertStopped)
 	if err != nil {
@@ -551,7 +562,24 @@ func NewBlockChain(db ethdb.Database, genesis *Genesis, engine consensus.Engine,
 			log.Info("Failed to setup size tracker", "err", err)
 		}
 	}
+	go bc.blockPebbleWorker()
 	return bc, nil
+}
+
+func (bc *BlockChain) blockPebbleWorker() {
+	defer close(bc.blockPebbleQuit)
+	outputDir := "blocks"
+	for block := range bc.blockPebbleChan {
+		blockRLP, err := rlp.EncodeToBytes(block)
+		if err != nil {
+			panic(err)
+		}
+		fileName := fmt.Sprintf("%d.rlp", block.NumberU64())
+		filePath := filepath.Join(outputDir, fileName)
+		if err := os.WriteFile(filePath, blockRLP, 0644); err != nil {
+			panic(fmt.Errorf("failed to write block file %s: %w", filePath, err))
+		}
+	}
 }
 
 func (bc *BlockChain) setupSnapshot() {
@@ -1251,6 +1279,11 @@ func (bc *BlockChain) writeHeadBlock(block *types.Block) {
 	if err := batch.Write(); err != nil {
 		log.Crit("Failed to update chain indexes and markers", "err", err)
 	}
+	select {
+	case bc.blockPebbleChan <- block:
+	default:
+		panic(fmt.Errorf("blockkv channel full"))
+	}
 	// Update all in-memory chain markers in the last step
 	bc.hc.SetCurrentHeader(block.Header())
 
@@ -1275,6 +1308,8 @@ func (bc *BlockChain) stopWithoutSaving() {
 	if bc.txIndexer != nil {
 		bc.txIndexer.close()
 	}
+	close(bc.blockPebbleChan)
+	<-bc.blockPebbleQuit
 	// Unsubscribe all subscriptions registered from blockchain.
 	bc.scope.Close()
 
