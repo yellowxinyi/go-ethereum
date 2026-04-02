@@ -59,7 +59,7 @@ var (
 
 	// snapBodyKeepBlocks is the number of most recent blocks for which bodies are kept
 	// during snap sync in the ultra-light observation mode.
-	snapBodyKeepBlocks = 128
+	snapBodyKeepBlocks uint64 = 128
 )
 
 var (
