@@ -388,19 +388,19 @@ func NewBlockChain(db ethdb.Database, genesis *Genesis, engine consensus.Engine,
 	}
 
 	bc := &BlockChain{
-		chainConfig:   chainConfig,
-		cfg:           cfg,
-		db:            db,
-		triedb:        triedb,
-		triegc:        prque.New[int64, common.Hash](nil),
-		chainmu:       syncx.NewClosableMutex(),
-		bodyCache:     lru.NewCache[common.Hash, *types.Body](bodyCacheLimit),
-		bodyRLPCache:  lru.NewCache[common.Hash, rlp.RawValue](bodyCacheLimit),
-		receiptsCache: lru.NewCache[common.Hash, []*types.Receipt](receiptsCacheLimit),
-		blockCache:    lru.NewCache[common.Hash, *types.Block](blockCacheLimit),
-		txLookupCache: lru.NewCache[common.Hash, txLookup](txLookupCacheLimit),
-		engine:        engine,
-		logger:        cfg.VmConfig.Tracer,
+		chainConfig:     chainConfig,
+		cfg:             cfg,
+		db:              db,
+		triedb:          triedb,
+		triegc:          prque.New[int64, common.Hash](nil),
+		chainmu:         syncx.NewClosableMutex(),
+		bodyCache:       lru.NewCache[common.Hash, *types.Body](bodyCacheLimit),
+		bodyRLPCache:    lru.NewCache[common.Hash, rlp.RawValue](bodyCacheLimit),
+		receiptsCache:   lru.NewCache[common.Hash, []*types.Receipt](receiptsCacheLimit),
+		blockCache:      lru.NewCache[common.Hash, *types.Block](blockCacheLimit),
+		txLookupCache:   lru.NewCache[common.Hash, txLookup](txLookupCacheLimit),
+		engine:          engine,
+		logger:          cfg.VmConfig.Tracer,
 		blockPebbleChan: make(chan *types.Block, 64),
 		blockPebbleQuit: make(chan struct{}),
 	}
@@ -1535,17 +1535,17 @@ func (bc *BlockChain) InsertReceiptChain(blockChain types.Blocks, receiptChain [
 			if bc.insertStopped() {
 				return 0, errInsertionInterrupted
 			}
-				if !skipPresenceCheck {
-					// Ignore if the entire data is already known
-					if bc.cfg.SnapBodyKeepBlocks > 0 {
-						if rawdb.HasReceipts(bc.db, block.Hash(), block.NumberU64()) {
-							stats.ignored++
-							continue
-						}
-					} else if bc.HasBlock(block.Hash(), block.NumberU64()) {
+			if !skipPresenceCheck {
+				// Ignore if the entire data is already known
+				if bc.cfg.SnapBodyKeepBlocks > 0 {
+					if rawdb.HasReceipts(bc.db, block.Hash(), block.NumberU64()) {
 						stats.ignored++
 						continue
-					} else {
+					}
+				} else if bc.HasBlock(block.Hash(), block.NumberU64()) {
+					stats.ignored++
+					continue
+				} else {
 					// If block N is not present, neither are the later blocks.
 					// This should be true, but if we are mistaken, the shortcut
 					// here will only cause overwriting of some existing data
@@ -1686,6 +1686,13 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 		bc.stateSizer.Notify(stateUpdate)
 	}
 	if bc.cfg.ObservationMode {
+		if stateUpdate != nil {
+			batch := bc.db.NewBatch()
+			rawdb.WriteFlatDeltaBatch(batch, block.NumberU64(), block.Hash(), stateUpdate.FlatDelta)
+			if err := batch.Write(); err != nil {
+				return err
+			}
+		}
 		return nil
 	}
 	// If node is running in path mode, skip explicit gc operation
@@ -1784,6 +1791,12 @@ func (bc *BlockChain) writeBlockAndSetHead(block *types.Block, receipts []*types
 		bc.chainHeadFeed.Send(ChainHeadEvent{Header: block.Header()})
 	}
 	bc.pruneBodyIfNeeded(block.NumberU64())
+	if bc.cfg.ObservationMode && bc.cfg.SnapBodyKeepBlocks > 0 {
+		keep := bc.cfg.SnapBodyKeepBlocks
+		if block.NumberU64() > keep {
+			rawdb.DeleteFlatDeltaRange(bc.db, block.NumberU64()-keep)
+		}
+	}
 	return CanonStatTy, nil
 }
 
@@ -2083,6 +2096,45 @@ func (bpr *blockProcessingResult) Witness() *stateless.Witness {
 	return bpr.witness
 }
 
+func (bc *BlockChain) buildReorgOverlay(targetRoot common.Hash) (*state.OverlayReader, error) {
+	head := bc.CurrentBlock()
+	if head == nil {
+		return nil, errors.New("missing head block")
+	}
+	overlay := state.NewOverlayReader(bc.db)
+	header := head
+	max := bc.cfg.SnapBodyKeepBlocks
+	if max == 0 {
+		max = 128
+	}
+	var steps uint64
+	for header != nil {
+		if header.Root == targetRoot {
+			return overlay, nil
+		}
+		if max > 0 && steps >= max {
+			return nil, errors.New("target state root out of flat-delta window")
+		}
+		if !rawdb.HasFlatDeltaMarker(bc.db, header.Number.Uint64(), header.Hash()) {
+			return nil, errors.New("missing flat delta for reorg block")
+		}
+		entries, err := rawdb.ReadFlatDeltaEntries(bc.db, header.Number.Uint64(), header.Hash())
+		if err != nil {
+			return nil, err
+		}
+		for i := len(entries) - 1; i >= 0; i-- {
+			entry := entries[i]
+			overlay.SetRaw(entry.Key, entry.OldValue, entry.OldExisted)
+		}
+		steps++
+		if header.Number.Uint64() == 0 {
+			break
+		}
+		header = bc.GetHeader(header.ParentHash, header.Number.Uint64()-1)
+	}
+	return nil, errors.New("target state root not found in canonical headers")
+}
+
 // ProcessBlock executes and validates the given block. If there was no error
 // it writes the block and associated state to database.
 func (bc *BlockChain) ProcessBlock(parentRoot common.Hash, block *types.Block, setHead bool, makeWitness bool) (_ *blockProcessingResult, blockEndErr error) {
@@ -2094,7 +2146,21 @@ func (bc *BlockChain) ProcessBlock(parentRoot common.Hash, block *types.Block, s
 	)
 	defer interrupt.Store(true) // terminate the prefetch at the end
 
-	if bc.cfg.NoPrefetch {
+	if bc.cfg.ObservationMode {
+		head := bc.CurrentBlock()
+		if head != nil && parentRoot != head.Root {
+			overlay, err := bc.buildReorgOverlay(parentRoot)
+			if err != nil {
+				return nil, err
+			}
+			statedb, err = state.NewWithReader(parentRoot, bc.statedb, overlay)
+		} else {
+			statedb, err = state.New(parentRoot, bc.statedb)
+		}
+		if err != nil {
+			return nil, err
+		}
+	} else if bc.cfg.NoPrefetch {
 		statedb, err = state.New(parentRoot, bc.statedb)
 		if err != nil {
 			return nil, err
@@ -2555,6 +2621,43 @@ func (bc *BlockChain) reorg(oldHead *types.Header, newHead *types.Header) error 
 	// as the txlookups should be changed atomically, and all subsequent
 	// reads should be blocked until the mutation is complete.
 	bc.txLookupLock.Lock()
+
+	if bc.cfg.ObservationMode {
+		for i := 0; i < len(oldChain); i++ {
+			header := oldChain[i]
+			if !rawdb.HasFlatDeltaMarker(bc.db, header.Number.Uint64(), header.Hash()) {
+				bc.txLookupLock.Unlock()
+				return errors.New("missing flat delta for reorg block")
+			}
+			entries, err := rawdb.ReadFlatDeltaEntries(bc.db, header.Number.Uint64(), header.Hash())
+			if err != nil {
+				bc.txLookupLock.Unlock()
+				return err
+			}
+			if len(entries) == 0 {
+				continue
+			}
+			batch := bc.db.NewBatch()
+			for j := len(entries) - 1; j >= 0; j-- {
+				entry := entries[j]
+				if entry.OldExisted {
+					if err := batch.Put(entry.Key, entry.OldValue); err != nil {
+						bc.txLookupLock.Unlock()
+						return err
+					}
+				} else {
+					if err := batch.Delete(entry.Key); err != nil {
+						bc.txLookupLock.Unlock()
+						return err
+					}
+				}
+			}
+			if err := batch.Write(); err != nil {
+				bc.txLookupLock.Unlock()
+				return err
+			}
+		}
+	}
 
 	// Reorg can be executed, start reducing the chain's old blocks and appending
 	// the new blocks

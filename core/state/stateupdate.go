@@ -20,6 +20,7 @@ import (
 	"maps"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/trie/trienode"
 	"github.com/ethereum/go-ethereum/triedb"
 )
@@ -69,6 +70,7 @@ type stateUpdate struct {
 	originRoot  common.Hash // hash of the state before applying mutation
 	root        common.Hash // hash of the state after applying mutation
 	blockNumber uint64      // Associated block number
+	FlatDelta   []rawdb.FlatDeltaEntry // ObservationMode-only flat-KV delta for reorg rollback
 
 	accounts       map[common.Hash][]byte    // accounts stores mutated accounts in 'slim RLP' encoding
 	accountsOrigin map[common.Address][]byte // accountsOrigin stores the original values of mutated accounts in 'slim RLP' encoding

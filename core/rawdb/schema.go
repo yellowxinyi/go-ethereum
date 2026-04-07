@@ -132,6 +132,8 @@ var (
 	FlatAccountPrefix = HashedAccountPrefix
 	FlatStoragePrefix = HashedStoragePrefix
 	FlatStateMetaPrefix = []byte("fM") // FlatStateMetaPrefix + key -> metadata (pivot root, flags)
+	FlatDeltaPrefix     = []byte("fD") // FlatDeltaPrefix + number + hash + index -> flat state delta entry
+	FlatDeltaWindowKey  = []byte("flat-delta-window")
 
 	// Path-based storage scheme of merkle patricia trie.
 	TrieNodeAccountPrefix = []byte("A") // TrieNodeAccountPrefix + hexPath -> trie node

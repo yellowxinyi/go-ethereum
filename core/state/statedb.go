@@ -18,6 +18,7 @@
 package state
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"maps"
@@ -135,6 +136,9 @@ type StateDB struct {
 	// Snapshot and RevertToSnapshot.
 	journal *journal
 
+	flatDelta     []rawdb.FlatDeltaEntry
+	flatDeltaKeys map[string]struct{}
+
 	// State witness if cross validation is needed
 	witness      *stateless.Witness
 	witnessStats *stateless.WitnessStats
@@ -230,6 +234,51 @@ func (s *StateDB) setError(err error) {
 	if s.dbErr == nil {
 		s.dbErr = err
 	}
+}
+
+func (s *StateDB) recordFlatDelta(key []byte, old []byte, existed bool) {
+	if !s.db.ObservationMode() {
+		return
+	}
+	if s.flatDeltaKeys == nil {
+		s.flatDeltaKeys = make(map[string]struct{})
+	}
+	k := string(key)
+	if _, ok := s.flatDeltaKeys[k]; ok {
+		return
+	}
+	s.flatDeltaKeys[k] = struct{}{}
+
+	entry := rawdb.FlatDeltaEntry{
+		Key:        append([]byte(nil), key...),
+		OldValue:   append([]byte(nil), old...),
+		OldExisted: existed,
+	}
+	s.flatDelta = append(s.flatDelta, entry)
+}
+
+func (s *StateDB) mergeLocalDelta(obj *stateObject) {
+	if obj == nil {
+		return
+	}
+	for _, entry := range obj.localDelta {
+		s.recordFlatDelta(entry.Key, entry.OldValue, entry.OldExisted)
+	}
+	obj.localDelta = nil
+	obj.localDeltaKeys = nil
+}
+
+func (s *StateDB) takeFlatDelta() []rawdb.FlatDeltaEntry {
+	delta := s.flatDelta
+	s.flatDelta = nil
+	s.flatDeltaKeys = nil
+	return delta
+}
+
+func encodeUint64(v uint64) []byte {
+	buf := make([]byte, 8)
+	binary.BigEndian.PutUint64(buf, v)
+	return buf
 }
 
 // Error returns the memorized database failure occurred earlier.
@@ -1320,6 +1369,8 @@ func (s *StateDB) commit(deleteEmptyObjects bool, noStorageWiping bool, blockNum
 // commitObservation writes state mutations into plain/hashed KV without trie maintenance.
 func (s *StateDB) commitObservation(deleteEmptyObjects bool, noStorageWiping bool, blockNumber uint64) (*stateUpdate, error) {
 	// Finalize all the dirty storage states without touching tries.
+	s.flatDelta = nil
+	s.flatDeltaKeys = nil
 	s.Finalise(deleteEmptyObjects)
 	if s.dbErr != nil {
 		return nil, fmt.Errorf("commit aborted due to database error: %v", s.dbErr)
@@ -1337,12 +1388,26 @@ func (s *StateDB) commitObservation(deleteEmptyObjects bool, noStorageWiping boo
 				continue
 			}
 			addrHash := crypto.Keccak256Hash(addr.Bytes())
+			plainAccOld := rawdb.ReadPlainAccount(disk, addr)
+			hashedAccOld := rawdb.ReadHashedAccount(disk, addrHash)
+			prevObj.recordLocalDelta(rawdb.PlainAccountKey(addr), plainAccOld, len(plainAccOld) > 0)
+			prevObj.recordLocalDelta(rawdb.HashedAccountKey(addrHash), hashedAccOld, len(hashedAccOld) > 0)
 			deletes[addrHash] = &accountDelete{
 				address: addr,
 				origin:  types.SlimAccountRLP(*prev),
 			}
-			plainIncarnation, _ := rawdb.ReadPlainIncarnation(disk, addr)
-			hashedIncarnation, _ := rawdb.ReadHashedIncarnation(disk, addrHash)
+			plainIncarnation, hasPlainInc := rawdb.ReadPlainIncarnation(disk, addr)
+			hashedIncarnation, hasHashedInc := rawdb.ReadHashedIncarnation(disk, addrHash)
+			if hasPlainInc {
+				prevObj.recordLocalDelta(rawdb.PlainIncarnationKey(addr), encodeUint64(plainIncarnation), true)
+			} else {
+				prevObj.recordLocalDelta(rawdb.PlainIncarnationKey(addr), nil, false)
+			}
+			if hasHashedInc {
+				prevObj.recordLocalDelta(rawdb.HashedIncarnationKey(addrHash), encodeUint64(hashedIncarnation), true)
+			} else {
+				prevObj.recordLocalDelta(rawdb.HashedIncarnationKey(addrHash), nil, false)
+			}
 			rawdb.WritePlainIncarnation(batch, addr, plainIncarnation+1)
 			rawdb.WriteHashedIncarnation(batch, addrHash, hashedIncarnation+1)
 			rawdb.DeletePlainAccount(batch, addr)
@@ -1367,6 +1432,13 @@ func (s *StateDB) commitObservation(deleteEmptyObjects bool, noStorageWiping boo
 		}
 		updates[obj.addrHash] = update
 	}
+	// Merge per-object flat deltas to avoid concurrent writes.
+	for _, obj := range s.stateObjects {
+		s.mergeLocalDelta(obj)
+	}
+	for _, obj := range s.stateObjectsDestruct {
+		s.mergeLocalDelta(obj)
+	}
 	// Update metrics with non-trie counters.
 	accountReadMeters.Mark(int64(s.AccountLoaded))
 	storageReadMeters.Mark(int64(s.StorageLoaded))
@@ -1389,7 +1461,9 @@ func (s *StateDB) commitObservation(deleteEmptyObjects bool, noStorageWiping boo
 	root := s.originalRoot
 	s.originalRoot = root
 
-	return newStateUpdate(noStorageWiping, origin, root, blockNumber, deletes, updates, nil), nil
+	ret := newStateUpdate(true, origin, root, blockNumber, deletes, updates, nil)
+	ret.FlatDelta = s.takeFlatDelta()
+	return ret, nil
 }
 
 // commitAndFlush is a wrapper of commit which also commits the state mutations
@@ -1401,6 +1475,11 @@ func (s *StateDB) commitAndFlush(block uint64, deleteEmptyObjects bool, noStorag
 	}
 	if s.db.ObservationMode() {
 		if db := s.db.TrieDB().Disk(); db != nil && len(ret.codes) > 0 {
+			for _, code := range ret.codes {
+				old := rawdb.ReadCode(db, code.hash)
+				key := append(rawdb.CodePrefix, code.hash.Bytes()...)
+				s.recordFlatDelta(key, old, len(old) > 0)
+			}
 			batch := db.NewBatch()
 			for _, code := range ret.codes {
 				rawdb.WriteCode(batch, code.hash, code.blob)

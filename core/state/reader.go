@@ -17,6 +17,7 @@
 package state
 
 import (
+	"encoding/binary"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -276,6 +277,189 @@ func (r *plainReader) Storage(addr common.Address, key common.Hash) (common.Hash
 	var value common.Hash
 	value.SetBytes(content)
 	return value, nil
+}
+
+type overlayEntry struct {
+	value   []byte
+	existed bool
+}
+
+// OverlayReader provides a read-only overlay on top of the flat-KV state.
+// It is intended for temporary reorg/fork execution views.
+type OverlayReader struct {
+	db      ethdb.KeyValueReader
+	lock    sync.RWMutex
+	entries map[string]overlayEntry
+}
+
+// NewOverlayReader constructs an overlay reader backed by the provided db.
+func NewOverlayReader(db ethdb.KeyValueReader) *OverlayReader {
+	return &OverlayReader{
+		db:      db,
+		entries: make(map[string]overlayEntry),
+	}
+}
+
+// SetRaw records an overlay value for the given raw key.
+func (r *OverlayReader) SetRaw(key []byte, value []byte, existed bool) {
+	if len(key) == 0 {
+		return
+	}
+	var copyVal []byte
+	if len(value) > 0 {
+		copyVal = append([]byte(nil), value...)
+	}
+	r.lock.Lock()
+	r.entries[string(key)] = overlayEntry{value: copyVal, existed: existed}
+	r.lock.Unlock()
+}
+
+func (r *OverlayReader) raw(key []byte) (overlayEntry, bool) {
+	r.lock.RLock()
+	entry, ok := r.entries[string(key)]
+	r.lock.RUnlock()
+	return entry, ok
+}
+
+func (r *OverlayReader) readIncarnationPlain(addr common.Address) (uint64, bool) {
+	if entry, ok := r.raw(rawdb.PlainIncarnationKey(addr)); ok {
+		if !entry.existed || len(entry.value) == 0 {
+			return 0, false
+		}
+		if len(entry.value) != 8 {
+			return 0, false
+		}
+		return binary.BigEndian.Uint64(entry.value), true
+	}
+	return rawdb.ReadPlainIncarnation(r.db, addr)
+}
+
+func (r *OverlayReader) readIncarnationHashed(addrHash common.Hash) (uint64, bool) {
+	if entry, ok := r.raw(rawdb.HashedIncarnationKey(addrHash)); ok {
+		if !entry.existed || len(entry.value) == 0 {
+			return 0, false
+		}
+		if len(entry.value) != 8 {
+			return 0, false
+		}
+		return binary.BigEndian.Uint64(entry.value), true
+	}
+	return rawdb.ReadHashedIncarnation(r.db, addrHash)
+}
+
+func (r *OverlayReader) decodeAccount(data []byte) (*types.StateAccount, error) {
+	if len(data) == 0 {
+		return nil, nil
+	}
+	var account types.StateAccount
+	if err := rlp.DecodeBytes(data, &account); err != nil {
+		return nil, err
+	}
+	if len(account.CodeHash) == 0 {
+		account.CodeHash = types.EmptyCodeHash.Bytes()
+	}
+	if account.Root == (common.Hash{}) {
+		account.Root = types.EmptyRootHash
+	}
+	return &account, nil
+}
+
+// Account implements StateReader with overlay support.
+func (r *OverlayReader) Account(addr common.Address) (*types.StateAccount, error) {
+	if entry, ok := r.raw(rawdb.PlainAccountKey(addr)); ok {
+		if entry.existed {
+			return r.decodeAccount(entry.value)
+		}
+	} else {
+		data := rawdb.ReadPlainAccount(r.db, addr)
+		if len(data) > 0 {
+			return r.decodeAccount(data)
+		}
+	}
+	addrHash := crypto.Keccak256Hash(addr.Bytes())
+	if entry, ok := r.raw(rawdb.HashedAccountKey(addrHash)); ok {
+		if !entry.existed {
+			return nil, nil
+		}
+		return r.decodeAccount(entry.value)
+	}
+	data := rawdb.ReadHashedAccount(r.db, addrHash)
+	return r.decodeAccount(data)
+}
+
+func (r *OverlayReader) decodeStorage(data []byte) (common.Hash, error) {
+	if len(data) == 0 {
+		return common.Hash{}, nil
+	}
+	if len(data) == common.HashLength {
+		return common.BytesToHash(data), nil
+	}
+	_, content, _, err := rlp.Split(data)
+	if err != nil {
+		return common.Hash{}, err
+	}
+	var value common.Hash
+	value.SetBytes(content)
+	return value, nil
+}
+
+// Storage implements StateReader with overlay support.
+func (r *OverlayReader) Storage(addr common.Address, key common.Hash) (common.Hash, error) {
+	if inc, ok := r.readIncarnationPlain(addr); ok {
+		plainKey := rawdb.PlainStorageKey(addr, inc, key)
+		if entry, ok := r.raw(plainKey); ok {
+			if !entry.existed {
+				goto hashed
+			}
+			return r.decodeStorage(entry.value)
+		}
+		data := rawdb.ReadPlainStorage(r.db, addr, inc, key)
+		if len(data) > 0 {
+			return r.decodeStorage(data)
+		}
+	}
+
+hashed:
+	addrHash := crypto.Keccak256Hash(addr.Bytes())
+	inc, ok := r.readIncarnationHashed(addrHash)
+	if !ok {
+		return common.Hash{}, nil
+	}
+	slotHash := crypto.Keccak256Hash(key.Bytes())
+	hashedKey := rawdb.HashedStorageKey(addrHash, inc, slotHash)
+	if entry, ok := r.raw(hashedKey); ok {
+		if !entry.existed {
+			return common.Hash{}, nil
+		}
+		return r.decodeStorage(entry.value)
+	}
+	data := rawdb.ReadHashedStorage(r.db, addrHash, inc, slotHash)
+	return r.decodeStorage(data)
+}
+
+// Code implements ContractCodeReader with overlay support.
+func (r *OverlayReader) Code(addr common.Address, codeHash common.Hash) ([]byte, error) {
+	key := append(rawdb.CodePrefix, codeHash.Bytes()...)
+	if entry, ok := r.raw(key); ok {
+		if !entry.existed {
+			return nil, nil
+		}
+		return append([]byte(nil), entry.value...), nil
+	}
+	code := rawdb.ReadCode(r.db, codeHash)
+	if len(code) == 0 {
+		return nil, nil
+	}
+	return code, nil
+}
+
+// CodeSize implements ContractCodeReader with overlay support.
+func (r *OverlayReader) CodeSize(addr common.Address, codeHash common.Hash) (int, error) {
+	code, err := r.Code(addr, codeHash)
+	if err != nil {
+		return 0, err
+	}
+	return len(code), nil
 }
 
 // trieReader implements the StateReader interface, providing functions to access
