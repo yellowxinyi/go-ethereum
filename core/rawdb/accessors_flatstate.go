@@ -22,6 +22,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/rlp"
 )
 
 // plainAccountKey = PlainAccountPrefix + address
@@ -74,9 +75,74 @@ func hashedStorageKeyPrefix(accountHash common.Hash, incarnation uint64) []byte 
 	return buf
 }
 
+func PlainAccountKey(address common.Address) []byte {
+	return plainAccountKey(address)
+}
+
+func PlainStorageKey(address common.Address, incarnation uint64, slot common.Hash) []byte {
+	return plainStorageKey(address, incarnation, slot)
+}
+
+func HashedAccountKey(accountHash common.Hash) []byte {
+	return hashedAccountKey(accountHash)
+}
+
+func HashedStorageKey(accountHash common.Hash, incarnation uint64, storageHash common.Hash) []byte {
+	return hashedStorageKey(accountHash, incarnation, storageHash)
+}
+
+func PlainIncarnationKey(address common.Address) []byte {
+	return flatStateIncarnationKeyByAddress(address)
+}
+
+func HashedIncarnationKey(accountHash common.Hash) []byte {
+	return flatStateIncarnationKeyByHash(accountHash)
+}
+
 // flatStateMetaKey = FlatStateMetaPrefix + key
 func flatStateMetaKey(key []byte) []byte {
 	return append(FlatStateMetaPrefix, key...)
+}
+
+func flatDeltaMarkerKey(number uint64, hash common.Hash) []byte {
+	key := make([]byte, 0, len("delta_")+8+common.HashLength)
+	key = append(key, []byte("delta_")...)
+	key = append(key, encodeBlockNumber(number)...)
+	key = append(key, hash.Bytes()...)
+	return flatStateMetaKey(key)
+}
+
+func flatDeltaMarkerPrefix(number uint64) []byte {
+	key := make([]byte, 0, len(FlatStateMetaPrefix)+len("delta_")+8)
+	key = append(key, FlatStateMetaPrefix...)
+	key = append(key, []byte("delta_")...)
+	key = append(key, encodeBlockNumber(number)...)
+	return key
+}
+
+func flatDeltaKey(number uint64, hash common.Hash, idx uint32) []byte {
+	buf := make([]byte, len(FlatDeltaPrefix)+8+common.HashLength+4)
+	n := copy(buf, FlatDeltaPrefix)
+	binary.BigEndian.PutUint64(buf[n:], number)
+	n += 8
+	n += copy(buf[n:], hash.Bytes())
+	binary.BigEndian.PutUint32(buf[n:], idx)
+	return buf
+}
+
+func flatDeltaKeyPrefix(number uint64, hash common.Hash) []byte {
+	buf := make([]byte, len(FlatDeltaPrefix)+8+common.HashLength)
+	n := copy(buf, FlatDeltaPrefix)
+	binary.BigEndian.PutUint64(buf[n:], number)
+	n += 8
+	copy(buf[n:], hash.Bytes())
+	return buf
+}
+
+type FlatDeltaEntry struct {
+	Key        []byte
+	OldValue   []byte
+	OldExisted bool
 }
 
 // flatStateIncarnationKeyByAddress = FlatStateMetaPrefix + "inc_a_" + address
@@ -215,6 +281,72 @@ func WriteFlatStateMeta(db ethdb.KeyValueWriter, key, value []byte) {
 func DeleteFlatStateMeta(db ethdb.KeyValueWriter, key []byte) {
 	if err := db.Delete(flatStateMetaKey(key)); err != nil {
 		log.Crit("Failed to delete flat state metadata", "err", err)
+	}
+}
+
+func WriteFlatDelta(db ethdb.KeyValueWriter, number uint64, hash common.Hash, idx uint32, entry FlatDeltaEntry) {
+	blob, err := rlp.EncodeToBytes(entry)
+	if err != nil {
+		log.Crit("Failed to encode flat delta entry", "err", err)
+	}
+	if err := db.Put(flatDeltaKey(number, hash, idx), blob); err != nil {
+		log.Crit("Failed to store flat delta entry", "err", err)
+	}
+}
+
+func WriteFlatDeltaBatch(db ethdb.KeyValueWriter, number uint64, hash common.Hash, entries []FlatDeltaEntry) {
+	if err := db.Put(flatDeltaMarkerKey(number, hash), []byte{1}); err != nil {
+		log.Crit("Failed to store flat delta marker", "err", err)
+	}
+	for i, entry := range entries {
+		WriteFlatDelta(db, number, hash, uint32(i), entry)
+	}
+}
+
+func HasFlatDeltaMarker(db ethdb.KeyValueReader, number uint64, hash common.Hash) bool {
+	ok, _ := db.Has(flatDeltaMarkerKey(number, hash))
+	return ok
+}
+
+func ReadFlatDeltaEntries(db ethdb.Iteratee, number uint64, hash common.Hash) ([]FlatDeltaEntry, error) {
+	it := db.NewIterator(flatDeltaKeyPrefix(number, hash), nil)
+	defer it.Release()
+
+	var entries []FlatDeltaEntry
+	for it.Next() {
+		var entry FlatDeltaEntry
+		if err := rlp.DecodeBytes(it.Value(), &entry); err != nil {
+			return nil, err
+		}
+		entries = append(entries, entry)
+	}
+	if err := it.Error(); err != nil {
+		return nil, err
+	}
+	return entries, nil
+}
+
+func DeleteFlatDeltaRange(db ethdb.KeyValueStore, number uint64) {
+	it := db.NewIterator(append(FlatDeltaPrefix, encodeBlockNumber(number)...), nil)
+	for it.Next() {
+		if err := db.Delete(it.Key()); err != nil {
+			log.Crit("Failed to delete flat delta entry", "err", err)
+		}
+	}
+	it.Release()
+	if err := it.Error(); err != nil {
+		log.Crit("Failed to iterate flat delta entries", "err", err)
+	}
+
+	it = db.NewIterator(flatDeltaMarkerPrefix(number), nil)
+	for it.Next() {
+		if err := db.Delete(it.Key()); err != nil {
+			log.Crit("Failed to delete flat delta marker", "err", err)
+		}
+	}
+	it.Release()
+	if err := it.Error(); err != nil {
+		log.Crit("Failed to iterate flat delta markers", "err", err)
 	}
 }
 
