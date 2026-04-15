@@ -2623,8 +2623,12 @@ func (bc *BlockChain) reorg(oldHead *types.Header, newHead *types.Header) error 
 	bc.txLookupLock.Lock()
 
 	if bc.cfg.ObservationMode {
+		cursor, hasCursor := rawdb.ReadFlatDeltaCursor(bc.db)
 		for i := 0; i < len(oldChain); i++ {
 			header := oldChain[i]
+			if applied, ok := rawdb.ReadFlatDeltaApplied(bc.db, header.Number.Uint64(), header.Hash()); ok && applied {
+				continue
+			}
 			if !rawdb.HasFlatDeltaMarker(bc.db, header.Number.Uint64(), header.Hash()) {
 				bc.txLookupLock.Unlock()
 				return errors.New("missing flat delta for reorg block")
@@ -2633,9 +2637,6 @@ func (bc *BlockChain) reorg(oldHead *types.Header, newHead *types.Header) error 
 			if err != nil {
 				bc.txLookupLock.Unlock()
 				return err
-			}
-			if len(entries) == 0 {
-				continue
 			}
 			batch := bc.db.NewBatch()
 			for j := len(entries) - 1; j >= 0; j-- {
@@ -2652,11 +2653,19 @@ func (bc *BlockChain) reorg(oldHead *types.Header, newHead *types.Header) error 
 					}
 				}
 			}
+			// Always mark applied (including empty delta blocks) for idempotent reorg.
+			rawdb.WriteFlatDeltaApplied(batch, header.Number.Uint64(), header.Hash(), true)
+			// Cursor is kept as diagnostic metadata, not as a hard gating condition.
+			rawdb.WriteFlatDeltaCursor(batch, header.Number.Uint64())
 			if err := batch.Write(); err != nil {
 				bc.txLookupLock.Unlock()
 				return err
 			}
+			cursor = header.Number.Uint64()
+			hasCursor = true
 		}
+		_ = cursor
+		_ = hasCursor
 	}
 
 	// Reorg can be executed, start reducing the chain's old blocks and appending
