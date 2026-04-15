@@ -120,6 +120,26 @@ func flatDeltaMarkerPrefix(number uint64) []byte {
 	return key
 }
 
+func flatDeltaAppliedKey(number uint64, hash common.Hash) []byte {
+	buf := make([]byte, len(FlatDeltaAppliedPrefix)+8+common.HashLength)
+	n := copy(buf, FlatDeltaAppliedPrefix)
+	binary.BigEndian.PutUint64(buf[n:], number)
+	n += 8
+	copy(buf[n:], hash.Bytes())
+	return buf
+}
+
+func flatDeltaAppliedPrefix(number uint64) []byte {
+	buf := make([]byte, len(FlatDeltaAppliedPrefix)+8)
+	n := copy(buf, FlatDeltaAppliedPrefix)
+	binary.BigEndian.PutUint64(buf[n:], number)
+	return buf
+}
+
+func flatDeltaCursorKey() []byte {
+	return flatStateMetaKey(FlatDeltaCursorKey)
+}
+
 func flatDeltaKey(number uint64, hash common.Hash, idx uint32) []byte {
 	buf := make([]byte, len(FlatDeltaPrefix)+8+common.HashLength+4)
 	n := copy(buf, FlatDeltaPrefix)
@@ -347,6 +367,60 @@ func DeleteFlatDeltaRange(db ethdb.KeyValueStore, number uint64) {
 	it.Release()
 	if err := it.Error(); err != nil {
 		log.Crit("Failed to iterate flat delta markers", "err", err)
+	}
+
+	it = db.NewIterator(flatDeltaAppliedPrefix(number), nil)
+	for it.Next() {
+		if err := db.Delete(it.Key()); err != nil {
+			log.Crit("Failed to delete flat delta applied marker", "err", err)
+		}
+	}
+	it.Release()
+	if err := it.Error(); err != nil {
+		log.Crit("Failed to iterate flat delta applied markers", "err", err)
+	}
+}
+
+// ReadFlatDeltaApplied retrieves whether the flat delta was applied for a block.
+func ReadFlatDeltaApplied(db ethdb.KeyValueReader, number uint64, hash common.Hash) (bool, bool) {
+	data, err := db.Get(flatDeltaAppliedKey(number, hash))
+	if err != nil || len(data) == 0 {
+		return false, false
+	}
+	return data[0] == 1, true
+}
+
+// WriteFlatDeltaApplied stores whether the flat delta was applied for a block.
+func WriteFlatDeltaApplied(db ethdb.KeyValueWriter, number uint64, hash common.Hash, applied bool) {
+	var v byte
+	if applied {
+		v = 1
+	}
+	if err := db.Put(flatDeltaAppliedKey(number, hash), []byte{v}); err != nil {
+		log.Crit("Failed to store flat delta applied marker", "err", err)
+	}
+}
+
+// DeleteFlatDeltaApplied removes the applied marker for a block.
+func DeleteFlatDeltaApplied(db ethdb.KeyValueWriter, number uint64, hash common.Hash) {
+	if err := db.Delete(flatDeltaAppliedKey(number, hash)); err != nil {
+		log.Crit("Failed to delete flat delta applied marker", "err", err)
+	}
+}
+
+// ReadFlatDeltaCursor retrieves the last rollback cursor.
+func ReadFlatDeltaCursor(db ethdb.KeyValueReader) (uint64, bool) {
+	data, err := db.Get(flatDeltaCursorKey())
+	if err != nil || len(data) != 8 {
+		return 0, false
+	}
+	return binary.BigEndian.Uint64(data), true
+}
+
+// WriteFlatDeltaCursor stores the rollback cursor.
+func WriteFlatDeltaCursor(db ethdb.KeyValueWriter, number uint64) {
+	if err := db.Put(flatDeltaCursorKey(), encodeBlockNumber(number)); err != nil {
+		log.Crit("Failed to store flat delta cursor", "err", err)
 	}
 }
 
