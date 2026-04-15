@@ -1534,6 +1534,9 @@ func (s *StateDB) commitAndFlush(block uint64, deleteEmptyObjects bool, noStorag
 		}
 	}
 	if s.db.ObservationMode() {
+		if !noStorageWiping {
+			return nil, errors.New("observation mode requires Cancun+ semantics (noStorageWiping=true)")
+		}
 		if db := s.db.TrieDB().Disk(); db != nil && len(ret.codes) > 0 {
 			for _, code := range ret.codes {
 				old := rawdb.ReadCode(db, code.hash)
