@@ -2,6 +2,7 @@ package core
 
 import (
 	"math/big"
+	"strings"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -160,5 +161,30 @@ func TestObservationModeReorgFlatDelta(t *testing.T) {
 	hashedB := readHashedBalance(t, db, addrB)
 	if plainB.IsZero() || hashedB.IsZero() {
 		t.Fatalf("expected addrB balance > 0 after reorg, plain=%v hashed=%v", plainB, hashedB)
+	}
+}
+
+func TestObservationModeRejectsPreCancunBlock(t *testing.T) {
+	db := rawdb.NewMemoryDatabase()
+	gspec := &Genesis{
+		Config: params.TestChainConfig,
+	}
+	genesis := gspec.MustCommit(db, triedb.NewDatabase(db, nil))
+	engine := ethash.NewFaker()
+	cfg := DefaultConfig()
+	cfg.ObservationMode = true
+	cfg.SnapBodyKeepBlocks = 128
+
+	chain, err := NewBlockChain(db, gspec, engine, cfg)
+	if err != nil {
+		t.Fatalf("NewBlockChain: %v", err)
+	}
+	defer chain.Stop()
+
+	blocks, _ := GenerateChain(gspec.Config, genesis, engine, db, 1, nil)
+	if _, err := chain.InsertChain(blocks); err == nil {
+		t.Fatal("expected pre-cancun rejection in observation mode")
+	} else if !strings.Contains(err.Error(), "observation mode requires Cancun+ semantics (noStorageWiping=true)") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
