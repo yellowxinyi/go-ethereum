@@ -2146,6 +2146,10 @@ func (bc *BlockChain) ProcessBlock(parentRoot common.Hash, block *types.Block, s
 	)
 	defer interrupt.Store(true) // terminate the prefetch at the end
 
+	if bc.cfg.ObservationMode && !bc.chainConfig.IsCancun(block.Number(), block.Time()) {
+		return nil, errors.New("observation mode requires Cancun+ semantics (noStorageWiping=true)")
+	}
+
 	if bc.cfg.ObservationMode {
 		head := bc.CurrentBlock()
 		if head != nil && parentRoot != head.Root {
