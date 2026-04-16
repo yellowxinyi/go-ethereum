@@ -118,6 +118,36 @@ func BenchmarkHashing(b *testing.B) {
 	})
 }
 
+func TestSaveSyncStatusObservationNilTrieDoesNotPanic(t *testing.T) {
+	t.Parallel()
+
+	db := rawdb.NewMemoryDatabase()
+	s := NewSyncer(db, rawdb.HashScheme, true)
+
+	sub := &storageTask{
+		genBatch: ethdb.HookedBatch{Batch: db.NewBatch()},
+	}
+	task := &accountTask{
+		SubTasks: map[common.Hash][]*storageTask{
+			common.HexToHash("0x1"): {sub},
+		},
+		genBatch:       ethdb.HookedBatch{Batch: db.NewBatch()},
+		stateCompleted: map[common.Hash]struct{}{},
+	}
+	s.tasks = []*accountTask{task}
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("saveSyncStatus panicked in observation mode with nil tries: %v", r)
+		}
+	}()
+	s.saveSyncStatus()
+
+	if status := rawdb.ReadSnapshotSyncStatus(db); len(status) == 0 {
+		t.Fatal("expected snapshot sync status to be persisted")
+	}
+}
+
 type (
 	accountHandlerFunc func(t *testPeer, requestId uint64, root common.Hash, origin common.Hash, limit common.Hash, cap int) error
 	storageHandlerFunc func(t *testPeer, requestId uint64, root common.Hash, accounts []common.Hash, origin, limit []byte, max int) error
