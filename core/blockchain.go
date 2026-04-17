@@ -333,6 +333,7 @@ type BlockChain struct {
 	flushInterval atomic.Int64                     // Time interval (processing time) after which to flush a state
 	triedb        *triedb.Database                 // The database handler for maintaining trie nodes.
 	codedb        *state.CodeDB                    // The database handler for maintaining contract codes.
+	statedb       *state.CachingDB                 // Cached state database wrapper.
 	txIndexer     *txIndexer                       // Transaction indexer, might be nil if not enabled
 
 	hc               *HeaderChain
@@ -440,7 +441,7 @@ func NewBlockChain(db ethdb.Database, genesis *Genesis, engine consensus.Engine,
 		return nil, err
 	}
 	bc.flushInterval.Store(int64(cfg.TrieTimeLimit))
-	bc.statedb = state.NewDatabase(bc.triedb, nil)
+	bc.statedb = state.NewDatabase(bc.triedb, bc.codedb)
 	if bc.cfg.ObservationMode {
 		// Observation mode reads state from plain-KV and does not rely on tries.
 		bc.statedb.EnableObservationMode(bc.db)
@@ -639,7 +640,7 @@ func (bc *BlockChain) setupSnapshot() {
 		}
 		bc.snaps, _ = snapshot.New(snapconfig, bc.db, bc.triedb, head.Root)
 		// Re-initialize the state database with snapshot
-		bc.statedb = state.NewDatabase(bc.triedb, bc.snaps)
+		bc.statedb = state.NewDatabase(bc.triedb, bc.codedb).WithSnapshot(bc.snaps)
 		if bc.cfg.ObservationMode {
 			// Observation mode reads state from plain-KV and does not rely on tries.
 			bc.statedb.EnableObservationMode(bc.db)
@@ -1745,7 +1746,7 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 		hasStateHook  = bc.logger != nil && bc.logger.OnStateUpdate != nil
 		hasStateSizer = bc.stateSizer != nil
 	)
-	if hasStateHook || hasStateSizer {
+	if hasStateHook || hasStateSizer || bc.cfg.ObservationMode {
 		r, update, err := statedb.CommitWithUpdate(block.NumberU64(), isEIP158, isCancun)
 		if err != nil {
 			return err
@@ -1760,6 +1761,13 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 		if hasStateSizer {
 			bc.stateSizer.Notify(update)
 		}
+		if bc.cfg.ObservationMode {
+			batch := bc.db.NewBatch()
+			rawdb.WriteFlatDeltaBatch(batch, block.NumberU64(), block.Hash(), update.FlatDelta)
+			if err := batch.Write(); err != nil {
+				return err
+			}
+		}
 		root = r
 	} else {
 		root, err = statedb.Commit(block.NumberU64(), isEIP158, isCancun)
@@ -1768,13 +1776,6 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 		}
 	}
 	if bc.cfg.ObservationMode {
-		if stateUpdate != nil {
-			batch := bc.db.NewBatch()
-			rawdb.WriteFlatDeltaBatch(batch, block.NumberU64(), block.Hash(), stateUpdate.FlatDelta)
-			if err := batch.Write(); err != nil {
-				return err
-			}
-		}
 		return nil
 	}
 	// If node is running in path mode, skip explicit gc operation

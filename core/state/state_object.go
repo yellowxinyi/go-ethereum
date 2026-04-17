@@ -501,19 +501,19 @@ func (s *stateObject) commit() (*accountUpdate, *trienode.NodeSet, error) {
 		if disk != nil {
 			batch := disk.NewBatch()
 			plainIncarnation, hasPlainInc := rawdb.ReadPlainIncarnation(disk, s.address)
-			hashedIncarnation, hasHashedInc := rawdb.ReadHashedIncarnation(disk, s.addrHash)
+			hashedIncarnation, hasHashedInc := rawdb.ReadHashedIncarnation(disk, s.addrHash())
 			if !hasPlainInc {
 				s.recordLocalDelta(rawdb.PlainIncarnationKey(s.address), nil, false)
 			}
 			if !hasHashedInc {
-				s.recordLocalDelta(rawdb.HashedIncarnationKey(s.addrHash), nil, false)
+				s.recordLocalDelta(rawdb.HashedIncarnationKey(s.addrHash()), nil, false)
 			}
 			if !hasPlainInc {
 				rawdb.WritePlainIncarnation(batch, s.address, 0)
 				plainIncarnation = 0
 			}
 			if !hasHashedInc {
-				rawdb.WriteHashedIncarnation(batch, s.addrHash, 0)
+				rawdb.WriteHashedIncarnation(batch, s.addrHash(), 0)
 				hashedIncarnation = 0
 			}
 			accountRLP, err := rlp.EncodeToBytes(&s.data)
@@ -521,24 +521,24 @@ func (s *stateObject) commit() (*accountUpdate, *trienode.NodeSet, error) {
 				return nil, nil, err
 			}
 			plainAccOld := rawdb.ReadPlainAccount(disk, s.address)
-			hashedAccOld := rawdb.ReadHashedAccount(disk, s.addrHash)
+			hashedAccOld := rawdb.ReadHashedAccount(disk, s.addrHash())
 			s.recordLocalDelta(rawdb.PlainAccountKey(s.address), plainAccOld, len(plainAccOld) > 0)
-			s.recordLocalDelta(rawdb.HashedAccountKey(s.addrHash), hashedAccOld, len(hashedAccOld) > 0)
+			s.recordLocalDelta(rawdb.HashedAccountKey(s.addrHash()), hashedAccOld, len(hashedAccOld) > 0)
 			rawdb.WritePlainAccount(batch, s.address, accountRLP)
-			rawdb.WriteHashedAccount(batch, s.addrHash, accountRLP)
+			rawdb.WriteHashedAccount(batch, s.addrHash(), accountRLP)
 			for key, encoded := range op.storagesByKey {
 				slotHash := crypto.Keccak256Hash(key.Bytes())
 				plainOld := rawdb.ReadPlainStorage(disk, s.address, plainIncarnation, key)
-				hashedOld := rawdb.ReadHashedStorage(disk, s.addrHash, hashedIncarnation, slotHash)
+				hashedOld := rawdb.ReadHashedStorage(disk, s.addrHash(), hashedIncarnation, slotHash)
 				s.recordLocalDelta(rawdb.PlainStorageKey(s.address, plainIncarnation, key), plainOld, len(plainOld) > 0)
-				s.recordLocalDelta(rawdb.HashedStorageKey(s.addrHash, hashedIncarnation, slotHash), hashedOld, len(hashedOld) > 0)
+				s.recordLocalDelta(rawdb.HashedStorageKey(s.addrHash(), hashedIncarnation, slotHash), hashedOld, len(hashedOld) > 0)
 				if len(encoded) == 0 {
 					rawdb.DeletePlainStorage(batch, s.address, plainIncarnation, key)
-					rawdb.DeleteHashedStorage(batch, s.addrHash, hashedIncarnation, slotHash)
+					rawdb.DeleteHashedStorage(batch, s.addrHash(), hashedIncarnation, slotHash)
 					continue
 				}
 				rawdb.WritePlainStorage(batch, s.address, plainIncarnation, key, encoded)
-				rawdb.WriteHashedStorage(batch, s.addrHash, hashedIncarnation, slotHash, encoded)
+				rawdb.WriteHashedStorage(batch, s.addrHash(), hashedIncarnation, slotHash, encoded)
 			}
 			if err := batch.Write(); err != nil {
 				return nil, nil, err

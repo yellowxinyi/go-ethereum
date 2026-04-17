@@ -60,8 +60,14 @@ func TestObservationModeReorgFlatDelta(t *testing.T) {
 	}
 	from2 := crypto.PubkeyToAddress(key2.PublicKey)
 	fromHash := crypto.Keccak256Hash(from.Bytes())
+	chainConfig := *params.TestChainConfig
+	shanghai := uint64(0)
+	cancun := uint64(0)
+	chainConfig.ShanghaiTime = &shanghai
+	chainConfig.CancunTime = &cancun
+	chainConfig.BlobScheduleConfig = params.DefaultBlobSchedule
 	gspec := &Genesis{
-		Config: params.TestChainConfig,
+		Config: &chainConfig,
 		Alloc: GenesisAlloc{
 			from:  {Balance: big.NewInt(1_000_000_000_000_000_000)},
 			from2: {Balance: big.NewInt(1_000_000_000_000_000_000)},

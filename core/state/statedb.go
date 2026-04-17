@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state/snapshot"
 	"github.com/ethereum/go-ethereum/core/stateless"
 	"github.com/ethereum/go-ethereum/core/tracing"
@@ -1485,7 +1486,7 @@ func (s *StateDB) commitObservation(deleteEmptyObjects bool, noStorageWiping boo
 		if err != nil {
 			return nil, err
 		}
-		updates[obj.addrHash] = update
+		updates[obj.addrHash()] = update
 	}
 	// Merge per-object flat deltas to avoid concurrent writes.
 	for _, obj := range s.stateObjects {
