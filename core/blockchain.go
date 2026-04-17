@@ -2165,6 +2165,10 @@ func (bc *BlockChain) pruneBodyIfNeeded(head uint64) {
 		return
 	}
 	cutoff := head - keep
+	if cutoff == 0 {
+		// Never prune genesis body.
+		return
+	}
 	hash := rawdb.ReadCanonicalHash(bc.db, cutoff)
 	if hash == (common.Hash{}) {
 		return
@@ -2769,12 +2773,10 @@ func (bc *BlockChain) reorg(oldHead *types.Header, newHead *types.Header) error 
 				continue
 			}
 			if !rawdb.HasFlatDeltaMarker(bc.db, header.Number.Uint64(), header.Hash()) {
-				bc.txLookupLock.Unlock()
 				return errors.New("missing flat delta for reorg block")
 			}
 			entries, err := rawdb.ReadFlatDeltaEntries(bc.db, header.Number.Uint64(), header.Hash())
 			if err != nil {
-				bc.txLookupLock.Unlock()
 				return err
 			}
 			batch := bc.db.NewBatch()
@@ -2782,12 +2784,10 @@ func (bc *BlockChain) reorg(oldHead *types.Header, newHead *types.Header) error 
 				entry := entries[j]
 				if entry.OldExisted {
 					if err := batch.Put(entry.Key, entry.OldValue); err != nil {
-						bc.txLookupLock.Unlock()
 						return err
 					}
 				} else {
 					if err := batch.Delete(entry.Key); err != nil {
-						bc.txLookupLock.Unlock()
 						return err
 					}
 				}
@@ -2797,7 +2797,6 @@ func (bc *BlockChain) reorg(oldHead *types.Header, newHead *types.Header) error 
 			// Cursor is kept as diagnostic metadata, not as a hard gating condition.
 			rawdb.WriteFlatDeltaCursor(batch, header.Number.Uint64())
 			if err := batch.Write(); err != nil {
-				bc.txLookupLock.Unlock()
 				return err
 			}
 			cursor = header.Number.Uint64()
