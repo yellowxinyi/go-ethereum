@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/consensus/beacon"
 	"github.com/ethereum/go-ethereum/consensus/ethash"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -66,6 +67,7 @@ func TestObservationModeReorgFlatDelta(t *testing.T) {
 	chainConfig.ShanghaiTime = &shanghai
 	chainConfig.CancunTime = &cancun
 	chainConfig.BlobScheduleConfig = params.DefaultBlobSchedule
+	chainConfig.TerminalTotalDifficulty = big.NewInt(0)
 	gspec := &Genesis{
 		Config: &chainConfig,
 		Alloc: GenesisAlloc{
@@ -93,7 +95,7 @@ func TestObservationModeReorgFlatDelta(t *testing.T) {
 	rawdb.WritePlainIncarnation(db, from2, 0)
 	rawdb.WriteHashedIncarnation(db, crypto.Keccak256Hash(from2.Bytes()), 0)
 
-	engine := ethash.NewFaker()
+	engine := beacon.New(ethash.NewFaker())
 	cfg := DefaultConfig()
 	cfg.ObservationMode = true
 	cfg.SnapBodyKeepBlocks = 128
