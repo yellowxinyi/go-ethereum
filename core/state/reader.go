@@ -23,9 +23,11 @@ import (
 	"sync/atomic"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/overlay"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/ethereum/go-ethereum/trie/bintrie"
@@ -371,28 +373,33 @@ hashed:
 }
 
 // Code implements ContractCodeReader with overlay support.
-func (r *OverlayReader) Code(addr common.Address, codeHash common.Hash) ([]byte, error) {
+func (r *OverlayReader) Code(addr common.Address, codeHash common.Hash) []byte {
 	key := append(rawdb.CodePrefix, codeHash.Bytes()...)
 	if entry, ok := r.raw(key); ok {
 		if !entry.existed {
-			return nil, nil
+			return nil
 		}
-		return append([]byte(nil), entry.value...), nil
+		return append([]byte(nil), entry.value...)
 	}
 	code := rawdb.ReadCode(r.db, codeHash)
 	if len(code) == 0 {
-		return nil, nil
+		return nil
 	}
-	return code, nil
+	return code
+}
+
+// Has implements ContractCodeReader with overlay support.
+func (r *OverlayReader) Has(addr common.Address, codeHash common.Hash) bool {
+	key := append(rawdb.CodePrefix, codeHash.Bytes()...)
+	if entry, ok := r.raw(key); ok {
+		return entry.existed
+	}
+	return rawdb.HasCode(r.db, codeHash)
 }
 
 // CodeSize implements ContractCodeReader with overlay support.
-func (r *OverlayReader) CodeSize(addr common.Address, codeHash common.Hash) (int, error) {
-	code, err := r.Code(addr, codeHash)
-	if err != nil {
-		return 0, err
-	}
-	return len(code), nil
+func (r *OverlayReader) CodeSize(addr common.Address, codeHash common.Hash) int {
+	return len(r.Code(addr, codeHash))
 }
 
 // trieReader implements the StateReader interface, providing functions to access
