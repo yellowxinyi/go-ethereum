@@ -25,6 +25,23 @@ import (
 	"github.com/ethereum/go-ethereum/rlp"
 )
 
+func deleteByPrefix(db ethdb.KeyValueStore, prefix []byte) int {
+	it := db.NewIterator(prefix, nil)
+	defer it.Release()
+
+	var deleted int
+	for it.Next() {
+		if err := db.Delete(it.Key()); err != nil {
+			log.Crit("Failed to delete key by prefix", "prefix", prefix, "err", err)
+		}
+		deleted++
+	}
+	if err := it.Error(); err != nil {
+		log.Crit("Failed to iterate keys by prefix", "prefix", prefix, "err", err)
+	}
+	return deleted
+}
+
 // plainAccountKey = PlainAccountPrefix + address
 func plainAccountKey(address common.Address) []byte {
 	return append(PlainAccountPrefix, address.Bytes()...)
@@ -478,4 +495,14 @@ func WriteHashedIncarnation(db ethdb.KeyValueWriter, accountHash common.Hash, in
 	if err := db.Put(flatStateIncarnationKeyByHash(accountHash), buf); err != nil {
 		log.Crit("Failed to store hashed incarnation", "err", err)
 	}
+}
+
+// ClearObservationState wipes observation-mode hashed state and related incarnation metadata.
+func ClearObservationState(db ethdb.KeyValueStore) {
+	deletedAccounts := deleteByPrefix(db, HashedAccountPrefix)
+	deletedStorage := deleteByPrefix(db, HashedStoragePrefix)
+	deletedIncarnationByHash := deleteByPrefix(db, flatStateMetaKey([]byte("inc_h_")))
+	deletedIncarnationByAddr := deleteByPrefix(db, flatStateMetaKey([]byte("inc_a_")))
+
+	log.Warn("Cleared observation hashed state", "accounts", deletedAccounts, "storage", deletedStorage, "incarnationsByHash", deletedIncarnationByHash, "incarnationsByAddr", deletedIncarnationByAddr)
 }
