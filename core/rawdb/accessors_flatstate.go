@@ -497,12 +497,20 @@ func WriteHashedIncarnation(db ethdb.KeyValueWriter, accountHash common.Hash, in
 	}
 }
 
-// ClearObservationState wipes observation-mode hashed state and related incarnation metadata.
+// ClearObservationState removes all observation-mode state keyspaces so the next
+// sync round can rebuild them from a clean baseline.
 func ClearObservationState(db ethdb.KeyValueStore) {
-	deletedAccounts := deleteByPrefix(db, HashedAccountPrefix)
-	deletedStorage := deleteByPrefix(db, HashedStoragePrefix)
-	deletedIncarnationByHash := deleteByPrefix(db, flatStateMetaKey([]byte("inc_h_")))
-	deletedIncarnationByAddr := deleteByPrefix(db, flatStateMetaKey([]byte("inc_a_")))
-
-	log.Warn("Cleared observation hashed state", "accounts", deletedAccounts, "storage", deletedStorage, "incarnationsByHash", deletedIncarnationByHash, "incarnationsByAddr", deletedIncarnationByAddr)
+	prefixes := [][]byte{
+		PlainAccountPrefix,
+		PlainStoragePrefix,
+		HashedAccountPrefix,
+		HashedStoragePrefix,
+		FlatStateMetaPrefix,
+		FlatDeltaPrefix,
+		FlatDeltaAppliedPrefix,
+	}
+	for _, prefix := range prefixes {
+		DeleteHistoryByRange(db, prefix)
+	}
+	DeleteSnapshotSyncStatus(db)
 }

@@ -301,10 +301,10 @@ func (d *Downloader) fetchHeaders(from uint64) error {
 		d.pivotLock.Lock()
 		if d.pivotHeader != nil {
 			if head.Number.Uint64() > d.pivotHeader.Number.Uint64()+2*uint64(fsMinFullBlocks)-8 {
-				if d.blockchain.ObservationMode() && d.pivotLocked {
+				if d.blockchain.ObservationMode() && d.obPivotLocked.Load() {
 					log.Warn("Pivot stale ignored due to lock", "pivot", d.pivotHeader.Number, "head", head.Number)
 					d.pivotLock.Unlock()
-					goto schedule
+					goto scheduleHeaders
 				}
 				// Retrieve the next pivot header, either from skeleton chain
 				// or the filled chain
@@ -339,6 +339,7 @@ func (d *Downloader) fetchHeaders(from uint64) error {
 	schedule:
 
 		// Retrieve a batch of headers and feed it to the header processor
+	scheduleHeaders:
 		var (
 			headers = make([]*types.Header, 0, maxHeadersProcess)
 			hashes  = make([]common.Hash, 0, maxHeadersProcess)

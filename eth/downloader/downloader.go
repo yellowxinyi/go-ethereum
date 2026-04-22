@@ -60,6 +60,10 @@ var (
 	// snapBodyKeepBlocks is the number of most recent blocks for which bodies are kept
 	// during snap sync in the ultra-light observation mode.
 	snapBodyKeepBlocks uint64 = 128
+
+	// Observation snap sync controls.
+	obMaxRetry          uint32        = 2
+	obNoProgressTimeout time.Duration = 20 * time.Minute
 )
 
 var (
@@ -154,6 +158,14 @@ type Downloader struct {
 	syncRound   uint64
 	pivotRetry  int
 	pivotMaxTry int
+
+	// Observation snap sync controls.
+	obPivotLocked       atomic.Bool
+	obRound             uint32
+	obRetryCount        uint32
+	obNoProgressSince   time.Time
+	obLastStateProgress uint64
+	obArchiveOnlyActive atomic.Bool
 
 	SnapSyncer     *snap.Syncer // TODO(karalabe): make private! hack for now
 	stateSyncStart chan *stateSync
@@ -626,6 +638,14 @@ func (d *Downloader) syncToHead() (err error) {
 		d.syncRound = 0
 		d.pivotRetry = 0
 		d.pivotLock.Unlock()
+		if d.blockchain.ObservationMode() {
+			d.obPivotLocked.Store(true)
+			d.obArchiveOnlyActive.Store(true)
+			d.SnapSyncer.SetArchiveOnly(true)
+			d.obRound = 1
+			d.obRetryCount = 0
+			d.resetObservationStateProgressLocked()
+		}
 
 		fetchers = append(fetchers, func() error { return d.processSnapSyncContent() })
 	} else if mode == ethconfig.FullSync {
@@ -1005,9 +1025,10 @@ func (d *Downloader) processSnapSyncContent() error {
 	// Note, there's no issue with memory piling up since after 64 blocks the
 	// pivot will forcefully move so these accumulators will be dropped.
 	var (
-		oldPivot *fetchResult   // Locked in pivot block, might change eventually
-		oldTail  []*fetchResult // Downloaded content after the pivot
-		timer    = time.NewTimer(time.Second)
+		oldPivot      *fetchResult   // Locked in pivot block, might change eventually
+		oldTail       []*fetchResult // Downloaded content after the pivot
+		pendingAfterP []*fetchResult // Downloaded post-pivot content waiting for pivot commit
+		timer         = time.NewTimer(time.Second)
 	)
 	defer timer.Stop()
 
@@ -1033,6 +1054,10 @@ func (d *Downloader) processSnapSyncContent() error {
 			default:
 			}
 		}
+		if len(pendingAfterP) > 0 {
+			results = append(pendingAfterP, results...)
+			pendingAfterP = nil
+		}
 		if d.chainInsertHook != nil {
 			d.chainInsertHook(results)
 		}
@@ -1044,21 +1069,31 @@ func (d *Downloader) processSnapSyncContent() error {
 		pivot := d.pivotHeader
 		locked := d.pivotLocked
 		d.pivotLock.RUnlock()
-
-		if oldPivot == nil { // no results piling up, we can move the pivot
-			if !d.committed.Load() { // not yet passed the pivot, we can move the pivot
-				if !d.blockchain.ObservationMode() || !locked {
-					if pivot.Root != sync.root { // pivot position changed, we can move the pivot
-						sync.Cancel()
-						sync = d.syncState(pivot.Root)
-
-						go closeOnErr(sync)
-					}
-				} else if pivot.Root != sync.root {
-					log.Debug("Ignoring pivot root switch in locked observation round", "round", round, "lockedRoot", lockedRoot, "incomingRoot", pivot.Root)
-				}
+		if d.blockchain.ObservationMode() && d.observationStateSyncStuck() {
+			expected := common.Hash{}
+			if oldPivot != nil && oldPivot.Header != nil {
+				expected = oldPivot.Header.Root
 			}
-		} else { // results already piled up, consume before handling pivot move
+			if err := d.retryObservationRound(&sync, &oldPivot, &oldTail, &pendingAfterP, "state sync stuck", expected, common.Hash{}, pivot.Number.Uint64()); err != nil {
+				return err
+			}
+			continue
+		}
+
+			if oldPivot == nil { // no results piling up, we can move the pivot
+				if !d.committed.Load() { // not yet passed the pivot, we can move the pivot
+					if pivot.Root != sync.root { // pivot position changed, we can move the pivot
+						if d.blockchain.ObservationMode() && d.obPivotLocked.Load() {
+							log.Warn("Pivot root switch ignored due to lock", "pivot", pivot.Number, "pivotRoot", pivot.Root, "syncRoot", sync.root)
+						} else {
+							sync.Cancel()
+							sync = d.syncState(pivot.Root)
+
+							go closeOnErr(sync)
+						}
+					}
+				}
+			} else { // results already piled up, consume before handling pivot move
 			results = append(append([]*fetchResult{oldPivot}, oldTail...), results...)
 		}
 		P, beforeP, afterP := splitAroundPivot(pivot.Number.Uint64(), results)
@@ -1085,40 +1120,27 @@ func (d *Downloader) processSnapSyncContent() error {
 				if sync.err != nil {
 					return sync.err
 				}
-				if d.blockchain.ObservationMode() {
-					computed, err := roothash.ComputeHashedStateRoot(d.stateDB)
-					if err != nil {
-						return err
-					}
-					if computed != lockedRoot {
-						d.pivotRetry++
-						if d.pivotRetry >= d.pivotMaxTry {
-							log.Error("Observation pivot validation failed", "round", round, "pivot", d.lockedPivot, "lockedRoot", lockedRoot, "localRoot", computed, "retry", d.pivotRetry, "result", "panic")
-							panic(fmt.Sprintf("pivot validation failed after %d retries: round=%d pivot=%d remote=%x local=%x", d.pivotMaxTry, round, d.lockedPivot, lockedRoot, computed))
-						}
-						log.Error("Observation pivot validation mismatch", "round", round, "pivot", d.lockedPivot, "lockedRoot", lockedRoot, "localRoot", computed, "retry", d.pivotRetry, "result", "retry")
-
-						sync.Cancel()
-						rawdb.ClearObservationState(d.stateDB)
-						if err := d.refreshPivotForRetry(); err != nil {
-							return err
-						}
-						pivot, lockedRoot, round, err = d.lockPivotForRound()
+					if d.blockchain.ObservationMode() {
+						computed, err := roothash.ComputeHashedStateRoot(d.stateDB)
 						if err != nil {
 							return err
 						}
-						sync = d.syncState(pivot.Root)
-						go closeOnErr(sync)
-
-						oldPivot = nil
-						oldTail = nil
-						continue
+						if computed != P.Header.Root {
+							if err := d.retryObservationRound(&sync, &oldPivot, &oldTail, &pendingAfterP, "pivot state root mismatch", P.Header.Root, computed, P.Header.Number.Uint64()); err != nil {
+								return err
+							}
+							continue
+						}
+						log.Info("Observation pivot validation passed", "round", d.obRound, "retry", d.obRetryCount, "pivot", P.Header.Number.Uint64(), "root", computed)
 					}
-					log.Info("Observation pivot validation passed", "round", round, "pivot", d.lockedPivot, "lockedRoot", lockedRoot, "localRoot", computed, "retry", d.pivotRetry, "result", "success")
-				}
 				d.pivotRetry = 0
 				if err := d.commitPivotBlock(P); err != nil {
 					return err
+				}
+				if d.blockchain.ObservationMode() {
+					d.obPivotLocked.Store(false)
+					d.obArchiveOnlyActive.Store(false)
+					d.SnapSyncer.SetArchiveOnly(false)
 				}
 				oldPivot = nil
 
@@ -1126,6 +1148,14 @@ func (d *Downloader) processSnapSyncContent() error {
 				oldTail = afterP
 				continue
 			}
+		}
+		if !d.committed.Load() {
+			// Never import post-pivot blocks before the pivot is committed.
+			// Buffer them until commit to preserve execute-before-prune semantics.
+			if len(afterP) > 0 {
+				pendingAfterP = append(pendingAfterP, afterP...)
+			}
+			continue
 		}
 		// Fast sync done, pivot commit done, full import
 		if len(afterP) > 0 && d.blockchain.ObservationMode() {
@@ -1141,6 +1171,95 @@ func (d *Downloader) processSnapSyncContent() error {
 			log.Info("Observation afterP apply done", "round", round, "count", len(afterP), "last", last, "result", "applied_then_prune")
 		}
 	}
+}
+
+func (d *Downloader) observationStateSyncStuck() bool {
+	progress, _ := d.SnapSyncer.Progress()
+	total := uint64(progress.AccountBytes + progress.StorageBytes + progress.BytecodeBytes)
+	if total > d.obLastStateProgress {
+		d.obLastStateProgress = total
+		d.obNoProgressSince = time.Time{}
+		return false
+	}
+	if d.obNoProgressSince.IsZero() {
+		d.obNoProgressSince = time.Now()
+		return false
+	}
+	return time.Since(d.obNoProgressSince) >= obNoProgressTimeout
+}
+
+func (d *Downloader) resetObservationStateProgressLocked() {
+	d.obNoProgressSince = time.Time{}
+	d.obLastStateProgress = 0
+}
+
+func (d *Downloader) refreshObservationPivotHeader() (*types.Header, error) {
+	head, tail, _, err := d.skeleton.Bounds()
+	if err != nil {
+		return nil, err
+	}
+	number := uint64(0)
+	if head.Number.Uint64() > uint64(fsMinFullBlocks) {
+		number = head.Number.Uint64() - uint64(fsMinFullBlocks)
+	}
+	pivot := d.skeleton.Header(number)
+	if pivot == nil && number < tail.Number.Uint64() {
+		dist := tail.Number.Uint64() - number
+		headers := d.readHeaderRange(tail, int(dist))
+		if len(headers) >= int(dist) {
+			pivot = headers[dist-1]
+		}
+	}
+	if pivot == nil {
+		return nil, errNoPivotHeader
+	}
+	d.pivotLock.Lock()
+	d.pivotHeader = pivot
+	d.pivotLock.Unlock()
+	rawdb.WriteLastPivotNumber(d.stateDB, pivot.Number.Uint64())
+	return pivot, nil
+}
+
+func (d *Downloader) retryObservationRound(sync **stateSync, oldPivot **fetchResult, oldTail *[]*fetchResult, pendingAfterP *[]*fetchResult, reason string, expected, local common.Hash, pivotNum uint64) error {
+	if d.obRetryCount+1 >= obMaxRetry {
+		panic(fmt.Sprintf("observation pivot validation failed after %d retries: round=%d pivot=%d reason=%s expected=%x local=%x", obMaxRetry, d.obRound, pivotNum, reason, expected, local))
+	}
+	d.obRetryCount++
+	d.obRound++
+	log.Warn("Observation round retrying", "round", d.obRound, "retry", d.obRetryCount, "reason", reason, "pivot", pivotNum, "expected", expected, "local", local)
+
+	if err := (*sync).Cancel(); err != nil && err != errCancelStateFetch && err != errCanceled && err != snap.ErrCancelled {
+		return err
+	}
+	d.clearObservationStateData()
+	newPivot, err := d.refreshObservationPivotHeader()
+	if err != nil {
+		return err
+	}
+	*sync = d.syncState(newPivot.Root)
+	go func(s *stateSync) {
+		if err := s.Wait(); err != nil && err != errCancelStateFetch && err != errCanceled && err != snap.ErrCancelled {
+			d.queue.Close()
+		}
+	}(*sync)
+
+	*oldPivot = nil
+	*oldTail = nil
+	*pendingAfterP = nil
+	d.committed.Store(false)
+	d.obArchiveOnlyActive.Store(true)
+	d.SnapSyncer.SetArchiveOnly(true)
+	d.resetObservationStateProgressLocked()
+
+	return nil
+}
+
+func (d *Downloader) clearObservationStateData() {
+	if !d.blockchain.ObservationMode() {
+		return
+	}
+	rawdb.ClearObservationState(d.stateDB)
+	log.Warn("Cleared observation state prefixes before retry")
 }
 
 func splitAroundPivot(pivot uint64, results []*fetchResult) (p *fetchResult, before, after []*fetchResult) {
@@ -1329,6 +1448,10 @@ func (d *Downloader) reportSnapSyncProgress(force bool) {
 		bodies   = fmt.Sprintf("%v@%v", log.FormatLogfmtUint64(block.Number.Uint64()), common.StorageSize(bodyBytes).TerminalString())
 		receipts = fmt.Sprintf("%v@%v", log.FormatLogfmtUint64(block.Number.Uint64()), common.StorageSize(receiptBytes).TerminalString())
 	)
-	log.Info("Syncing: chain download in progress", "synced", progress, "chain", syncedBytes, "headers", headers, "bodies", bodies, "receipts", receipts, "eta", common.PrettyDuration(eta))
+	if d.blockchain.ObservationMode() {
+		log.Info("Syncing: chain download in progress", "synced", progress, "chain", syncedBytes, "headers", headers, "bodies", bodies, "receipts", receipts, "eta", common.PrettyDuration(eta), "ob_round", d.obRound, "ob_retry", d.obRetryCount, "ob_pivot_lock", d.obPivotLocked.Load(), "ob_archive_only", d.obArchiveOnlyActive.Load())
+	} else {
+		log.Info("Syncing: chain download in progress", "synced", progress, "chain", syncedBytes, "headers", headers, "bodies", bodies, "receipts", receipts, "eta", common.PrettyDuration(eta))
+	}
 	d.syncLogTime = time.Now()
 }

@@ -96,6 +96,12 @@ const (
 
 	// batchSizeThreshold is the maximum size allowed for gentrie batch.
 	batchSizeThreshold = 8 * 1024 * 1024
+
+	// Observation-mode candidate routing defaults.
+	obCandidateMinPeers = 20
+	obProbeRatio        = 0.15
+	obScoreHigh         = 6
+	obScoreLow          = -4
 )
 
 var (
@@ -442,9 +448,11 @@ type SyncPeer interface {
 //   - The peer delivers a stale response after a previous timeout
 //   - The peer delivers a refusal to serve the requested state
 type Syncer struct {
-	db     ethdb.KeyValueStore // Database to store the trie nodes into (and dedup)
-	scheme string              // Node scheme used in node database
-	observation bool           // Whether to run in observation mode (no trie healing)
+	db          ethdb.KeyValueStore // Database to store the trie nodes into (and dedup)
+	scheme      string              // Node scheme used in node database
+	observation bool                // Whether to run in observation mode (no trie healing)
+	// archiveOnlyActive toggles observation candidate routing during locked-pivot sync.
+	archiveOnlyActive bool
 
 	root    common.Hash    // Current state trie root being synced
 	tasks   []*accountTask // Current account task set being synced
@@ -452,10 +460,11 @@ type Syncer struct {
 	healer  *healTask      // Current state healing task being executed
 	update  chan struct{}  // Notification channel for possible sync progression
 
-	peers    map[string]SyncPeer // Currently active peers to download from
-	peerJoin *event.Feed         // Event feed to react to peers joining
-	peerDrop *event.Feed         // Event feed to react to peers dropping
-	rates    *msgrate.Trackers   // Message throughput rates for peers
+	peers      map[string]SyncPeer // Currently active peers to download from
+	peerJoin   *event.Feed         // Event feed to react to peers joining
+	peerDrop   *event.Feed         // Event feed to react to peers dropping
+	rates      *msgrate.Trackers   // Message throughput rates for peers
+	peerScores map[string]int      // Observation peer score by peer id
 
 	// Request tracking during syncing phase
 	statelessPeers map[string]struct{} // Peers that failed to deliver state data
@@ -510,21 +519,29 @@ type Syncer struct {
 
 	pend sync.WaitGroup // Tracks network request goroutines for graceful shutdown
 	lock sync.RWMutex   // Protects fields that can change outside of sync (peers, reqs, root)
+
+	// Observation candidate routing parameters.
+	candidateMinPeers int
+	probeRatio        float64
+	scoreHigh         int
+	scoreLow          int
 }
 
 // NewSyncer creates a new snapshot syncer to download the Ethereum state over the
 // snap protocol.
 func NewSyncer(db ethdb.KeyValueStore, scheme string, observation bool) *Syncer {
 	return &Syncer{
-		db:     db,
-		scheme: scheme,
-		observation: observation,
+		db:                db,
+		scheme:            scheme,
+		observation:       observation,
+		archiveOnlyActive: observation,
 
-		peers:    make(map[string]SyncPeer),
-		peerJoin: new(event.Feed),
-		peerDrop: new(event.Feed),
-		rates:    msgrate.NewTrackers(log.New("proto", "snap")),
-		update:   make(chan struct{}, 1),
+		peers:      make(map[string]SyncPeer),
+		peerJoin:   new(event.Feed),
+		peerDrop:   new(event.Feed),
+		rates:      msgrate.NewTrackers(log.New("proto", "snap")),
+		peerScores: make(map[string]int),
+		update:     make(chan struct{}, 1),
 
 		accountIdlers:  make(map[string]struct{}),
 		storageIdlers:  make(map[string]struct{}),
@@ -543,7 +560,19 @@ func NewSyncer(db ethdb.KeyValueStore, scheme string, observation bool) *Syncer 
 		stateWriter:          db.NewBatch(),
 
 		extProgress: new(SyncProgress),
+
+		candidateMinPeers: obCandidateMinPeers,
+		probeRatio:        obProbeRatio,
+		scoreHigh:         obScoreHigh,
+		scoreLow:          obScoreLow,
 	}
+}
+
+// SetArchiveOnly toggles observation candidate routing mode.
+func (s *Syncer) SetArchiveOnly(active bool) {
+	s.lock.Lock()
+	s.archiveOnlyActive = active
+	s.lock.Unlock()
 }
 
 // Register injects a new data source into the syncer's peerset.
@@ -559,6 +588,7 @@ func (s *Syncer) Register(peer SyncPeer) error {
 		return errors.New("already registered")
 	}
 	s.peers[id] = peer
+	s.peerScores[id] = 0
 	s.rates.Track(id, msgrate.NewTracker(s.rates.MeanCapacities(), s.rates.MedianRoundTrip()))
 
 	// Mark the peer as idle, even if no sync is running
@@ -585,6 +615,7 @@ func (s *Syncer) Unregister(id string) error {
 		return errors.New("not registered")
 	}
 	delete(s.peers, id)
+	delete(s.peerScores, id)
 	s.rates.Untrack(id)
 
 	// Remove status markers, even if no sync is running
@@ -641,6 +672,9 @@ func (s *Syncer) Sync(root common.Hash, cancel chan struct{}) error {
 	}()
 
 	log.Debug("Starting snapshot sync cycle", "root", root)
+	if s.observation {
+		log.Info("Observation candidate routing configured", "candidateMinPeers", s.candidateMinPeers, "probeRatio", s.probeRatio, "scoreHigh", s.scoreHigh, "scoreLow", s.scoreLow)
+	}
 
 	// Flush out the last committed raw states
 	defer func() {
@@ -1038,6 +1072,50 @@ func (s *Syncer) cleanStorageTasks() {
 	}
 }
 
+func (s *Syncer) candidateCountLocked() int {
+	count := 0
+	for id := range s.peers {
+		if s.peerScores[id] >= s.scoreHigh {
+			count++
+		}
+	}
+	return count
+}
+
+func (s *Syncer) allowObservationPeerLocked(id string, candidates int) bool {
+	if !s.observation || !s.archiveOnlyActive {
+		return true
+	}
+	score := s.peerScores[id]
+	if score >= s.scoreHigh {
+		return true
+	}
+	// Low-score peers are treated as temporarily unreliable in archive-only mode.
+	// Keep a tiny probe chance only when candidates are still insufficient.
+	if score <= s.scoreLow {
+		if candidates < s.candidateMinPeers {
+			return rand.Float64() < gomath.Min(0.05, s.probeRatio*0.25)
+		}
+		return false
+	}
+	// Keep probing normal peers even when enough candidates exist so we can
+	// discover newly useful peers and avoid candidate pool staleness.
+	probe := s.probeRatio
+	if candidates < s.candidateMinPeers {
+		probe = gomath.Min(1.0, s.probeRatio*2)
+	}
+	return rand.Float64() < probe
+}
+
+func (s *Syncer) updatePeerScoreLocked(id string, delta int) {
+	score, ok := s.peerScores[id]
+	if !ok {
+		return
+	}
+	score += delta
+	s.peerScores[id] = score
+}
+
 // assignAccountTasks attempts to match idle peers to pending account range
 // retrievals.
 func (s *Syncer) assignAccountTasks(success chan *accountResponse, fail chan *accountRequest, cancel chan struct{}) {
@@ -1050,8 +1128,12 @@ func (s *Syncer) assignAccountTasks(success chan *accountResponse, fail chan *ac
 		caps: make([]int, 0, len(s.accountIdlers)),
 	}
 	targetTTL := s.rates.TargetTimeout()
+	candidates := s.candidateCountLocked()
 	for id := range s.accountIdlers {
 		if _, ok := s.statelessPeers[id]; ok {
+			continue
+		}
+		if !s.allowObservationPeerLocked(id, candidates) {
 			continue
 		}
 		idlers.ids = append(idlers.ids, id)
@@ -1147,8 +1229,12 @@ func (s *Syncer) assignBytecodeTasks(success chan *bytecodeResponse, fail chan *
 		caps: make([]int, 0, len(s.bytecodeIdlers)),
 	}
 	targetTTL := s.rates.TargetTimeout()
+	candidates := s.candidateCountLocked()
 	for id := range s.bytecodeIdlers {
 		if _, ok := s.statelessPeers[id]; ok {
+			continue
+		}
+		if !s.allowObservationPeerLocked(id, candidates) {
 			continue
 		}
 		idlers.ids = append(idlers.ids, id)
@@ -1250,8 +1336,12 @@ func (s *Syncer) assignStorageTasks(success chan *storageResponse, fail chan *st
 		caps: make([]int, 0, len(s.storageIdlers)),
 	}
 	targetTTL := s.rates.TargetTimeout()
+	candidates := s.candidateCountLocked()
 	for id := range s.storageIdlers {
 		if _, ok := s.statelessPeers[id]; ok {
+			continue
+		}
+		if !s.allowObservationPeerLocked(id, candidates) {
 			continue
 		}
 		idlers.ids = append(idlers.ids, id)
@@ -1734,6 +1824,7 @@ func (s *Syncer) revertAccountRequest(req *accountRequest) {
 	delete(s.accountReqs, req.id)
 	if _, ok := s.peers[req.peer]; ok {
 		s.accountIdlers[req.peer] = struct{}{}
+		s.updatePeerScoreLocked(req.peer, -2)
 	}
 	s.lock.Unlock()
 
@@ -1779,6 +1870,7 @@ func (s *Syncer) revertBytecodeRequest(req *bytecodeRequest) {
 	delete(s.bytecodeReqs, req.id)
 	if _, ok := s.peers[req.peer]; ok {
 		s.bytecodeIdlers[req.peer] = struct{}{}
+		s.updatePeerScoreLocked(req.peer, -2)
 	}
 	s.lock.Unlock()
 
@@ -1824,6 +1916,7 @@ func (s *Syncer) revertStorageRequest(req *storageRequest) {
 	delete(s.storageReqs, req.id)
 	if _, ok := s.peers[req.peer]; ok {
 		s.storageIdlers[req.peer] = struct{}{}
+		s.updatePeerScoreLocked(req.peer, -2)
 	}
 	s.lock.Unlock()
 
@@ -2689,11 +2782,22 @@ func (s *Syncer) OnAccounts(peer SyncPeer, id uint64, hashes []common.Hash, acco
 		accounts: accs,
 		cont:     cont,
 	}
+	delta := 0
 	select {
 	case req.deliver <- response:
+		delta = 1
 	case <-req.cancel:
+		delta = 0
 	case <-req.stale:
+		delta = 1
 	}
+	s.lock.Lock()
+	if delta != 0 {
+		if _, ok := s.peers[peer.ID()]; ok {
+			s.updatePeerScoreLocked(peer.ID(), delta)
+		}
+	}
+	s.lock.Unlock()
 	return nil
 }
 
@@ -2800,11 +2904,22 @@ func (s *Syncer) onByteCodes(peer SyncPeer, id uint64, bytecodes [][]byte) error
 		hashes: req.hashes,
 		codes:  codes,
 	}
+	delta := 0
 	select {
 	case req.deliver <- response:
+		delta = 1
 	case <-req.cancel:
+		delta = 0
 	case <-req.stale:
+		delta = 1
 	}
+	s.lock.Lock()
+	if delta != 0 {
+		if _, ok := s.peers[peer.ID()]; ok {
+			s.updatePeerScoreLocked(peer.ID(), delta)
+		}
+	}
+	s.lock.Unlock()
 	return nil
 }
 
@@ -2949,11 +3064,22 @@ func (s *Syncer) OnStorage(peer SyncPeer, id uint64, hashes [][]common.Hash, slo
 		slots:    slots,
 		cont:     cont,
 	}
+	delta := 0
 	select {
 	case req.deliver <- response:
+		delta = 1
 	case <-req.cancel:
+		delta = 0
 	case <-req.stale:
+		delta = 1
 	}
+	s.lock.Lock()
+	if delta != 0 {
+		if _, ok := s.peers[peer.ID()]; ok {
+			s.updatePeerScoreLocked(peer.ID(), delta)
+		}
+	}
+	s.lock.Unlock()
 	return nil
 }
 
