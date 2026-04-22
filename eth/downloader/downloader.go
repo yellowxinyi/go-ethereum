@@ -789,10 +789,9 @@ func (d *Downloader) processHeaders(origin uint64) error {
 					case <-timer.C:
 					}
 				}
-				// Otherwise, schedule the headers for content retrieval. In snap sync,
-				// bodies are only scheduled for the last snapBodyKeepBlocks, while
-				// receipts are always scheduled.
-				scheduleHeaders := chunkHeaders
+					// Otherwise, schedule the headers for content retrieval. In snap sync,
+					// body and receipt retrievals are both windowed by snapBodyKeepBlocks.
+					scheduleHeaders := chunkHeaders
 				scheduleHashes := chunkHashes
 				scheduleOrigin := origin
 				if mode == ethconfig.SnapSync && cutoff != 0 {
