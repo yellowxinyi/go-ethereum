@@ -98,10 +98,10 @@ const (
 	batchSizeThreshold = 8 * 1024 * 1024
 
 	// Observation-mode candidate routing defaults.
-	obCandidateMinPeers = 20
-	obProbeRatio        = 0.15
-	obScoreHigh         = 6
-	obScoreLow          = -4
+	obCandidateMinPeers = 12
+	obProbeRatio        = 0.10
+	obScoreHigh         = 4
+	obScoreLow          = -3
 )
 
 var (

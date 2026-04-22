@@ -63,7 +63,7 @@ var (
 
 	// Observation snap sync controls.
 	obMaxRetry          uint32        = 2
-	obNoProgressTimeout time.Duration = 20 * time.Minute
+	obNoProgressTimeout time.Duration = 35 * time.Minute
 )
 
 var (
