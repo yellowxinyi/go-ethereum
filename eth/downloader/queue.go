@@ -143,8 +143,9 @@ type queue struct {
 	receiptPendPool  map[string]*fetchRequest           // Currently pending receipt retrieval operations
 	receiptWakeCh    chan bool                          // Channel to notify when receipt fetcher of new tasks
 
-	// skipBody tracks headers whose bodies should be skipped in snap sync.
-	skipBody map[common.Hash]struct{}
+	// skipBody/skipReceipt track headers whose body/receipt should be skipped in snap sync.
+	skipBody    map[common.Hash]struct{}
+	skipReceipt map[common.Hash]struct{}
 
 	resultCache *resultStore       // Downloaded but not yet delivered fetch results
 	resultSize  common.StorageSize // Approximate size of a block (exponential moving average)
@@ -189,6 +190,7 @@ func (q *queue) Reset(blockCacheLimit int, thresholdInitialSize int) {
 	q.receiptPendPool = make(map[string]*fetchRequest)
 
 	q.skipBody = make(map[common.Hash]struct{})
+	q.skipReceipt = make(map[common.Hash]struct{})
 
 	q.resultCache = newResultStore(blockCacheLimit)
 	q.resultCache.SetThrottleThreshold(uint64(thresholdInitialSize))
@@ -292,8 +294,8 @@ func (q *queue) Schedule(headers []*types.Header, hashes []common.Hash, from uin
 	return inserts
 }
 
-// ScheduleWithBodyCutoff schedules headers like Schedule, but marks bodies at or
-// below the cutoff as skipped. Receipts are still scheduled for all headers.
+// ScheduleWithBodyCutoff schedules headers like Schedule, but marks bodies and
+// receipts at or below the cutoff as skipped.
 func (q *queue) ScheduleWithBodyCutoff(headers []*types.Header, hashes []common.Hash, from uint64, enabled bool, cutoff uint64) int {
 	q.lock.Lock()
 	defer q.lock.Unlock()
@@ -313,6 +315,7 @@ func (q *queue) ScheduleWithBodyCutoff(headers []*types.Header, hashes []common.
 		}
 		if enabled && header.Number.Uint64() <= cutoff {
 			q.skipBody[hash] = struct{}{}
+			q.skipReceipt[hash] = struct{}{}
 		}
 		// Make sure no duplicate requests are executed
 		// We cannot skip this, even if the block is empty, since this is
@@ -325,11 +328,13 @@ func (q *queue) ScheduleWithBodyCutoff(headers []*types.Header, hashes []common.
 		}
 		// Queue for receipt retrieval
 		if q.mode == ethconfig.SnapSync && !header.EmptyReceipts() {
-			if _, ok := q.receiptTaskPool[hash]; ok {
-				log.Warn("Header already scheduled for receipt fetch", "number", header.Number, "hash", hash)
-			} else {
-				q.receiptTaskPool[hash] = header
-				q.receiptTaskQueue.Push(header, -int64(header.Number.Uint64()))
+			if _, skip := q.skipReceipt[hash]; !skip {
+				if _, ok := q.receiptTaskPool[hash]; ok {
+					log.Warn("Header already scheduled for receipt fetch", "number", header.Number, "hash", hash)
+				} else {
+					q.receiptTaskPool[hash] = header
+					q.receiptTaskQueue.Push(header, -int64(header.Number.Uint64()))
+				}
 			}
 		}
 		inserts++
@@ -485,6 +490,7 @@ func (q *queue) reserveHeaders(p *peerConnection, count int, taskPool map[common
 			progress = true
 			delete(taskPool, header.Hash())
 			delete(q.skipBody, header.Hash())
+			delete(q.skipReceipt, header.Hash())
 			log.Error("Fetch reservation already delivered", "number", header.Number.Uint64())
 			continue
 		}
@@ -507,6 +513,10 @@ func (q *queue) reserveHeaders(p *peerConnection, count int, taskPool map[common
 				item.SetBodyDone()
 				delete(q.skipBody, header.Hash())
 			}
+		}
+		if _, ok := q.skipReceipt[header.Hash()]; ok {
+			item.SetReceiptsDone()
+			delete(q.skipReceipt, header.Hash())
 		}
 		if item.Done(kind) {
 			// If it's a noop, we can skip this task
