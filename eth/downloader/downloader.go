@@ -64,6 +64,8 @@ var (
 	// Observation snap sync controls.
 	obMaxRetry          uint32        = 2
 	obNoProgressTimeout time.Duration = 35 * time.Minute
+	obShortStallTimeout time.Duration = 5 * time.Minute
+	obEvictRequirePeers int           = 50
 )
 
 var (
@@ -1065,12 +1067,27 @@ func (d *Downloader) processSnapSyncContent() error {
 
 		// If we haven't downloaded the pivot block yet, check pivot staleness
 		// notifications from the header downloader
-		d.pivotLock.RLock()
-		pivot := d.pivotHeader
-		d.pivotLock.RUnlock()
-		if d.blockchain.ObservationMode() && d.observationStateSyncStuck() {
-			expected := common.Hash{}
-			if oldPivot != nil && oldPivot.Header != nil {
+			d.pivotLock.RLock()
+			pivot := d.pivotHeader
+			d.pivotLock.RUnlock()
+			if d.blockchain.ObservationMode() && d.obArchiveOnlyActive.Load() && d.observationStateSyncStalledShort() {
+				totalPeers := d.peers.Len()
+				if totalPeers >= obEvictRequirePeers {
+					now := time.Now()
+					evicted := d.SnapSyncer.EvictLowScorePeers(now)
+					if len(evicted) > 0 {
+						for _, id := range evicted {
+							if d.dropPeer != nil {
+								d.dropPeer(id)
+							}
+						}
+						log.Warn("Observation eviction applied", "evicted", len(evicted), "total_peers", totalPeers, "ban_active", d.SnapSyncer.ActiveBanCount(now))
+					}
+				}
+			}
+			if d.blockchain.ObservationMode() && d.observationStateSyncStuck() {
+				expected := common.Hash{}
+				if oldPivot != nil && oldPivot.Header != nil {
 				expected = oldPivot.Header.Root
 			}
 			if err := d.retryObservationRound(&sync, &oldPivot, &oldTail, &pendingAfterP, "state sync stuck", expected, common.Hash{}, pivot.Number.Uint64()); err != nil {
@@ -1185,6 +1202,21 @@ func (d *Downloader) observationStateSyncStuck() bool {
 		return false
 	}
 	return time.Since(d.obNoProgressSince) >= obNoProgressTimeout
+}
+
+func (d *Downloader) observationStateSyncStalledShort() bool {
+	progress, _ := d.SnapSyncer.Progress()
+	total := uint64(progress.AccountBytes + progress.StorageBytes + progress.BytecodeBytes)
+	if total > d.obLastStateProgress {
+		d.obLastStateProgress = total
+		d.obNoProgressSince = time.Time{}
+		return false
+	}
+	if d.obNoProgressSince.IsZero() {
+		d.obNoProgressSince = time.Now()
+		return false
+	}
+	return time.Since(d.obNoProgressSince) >= obShortStallTimeout
 }
 
 func (d *Downloader) resetObservationStateProgressLocked() {

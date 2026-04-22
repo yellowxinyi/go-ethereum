@@ -102,6 +102,12 @@ const (
 	obProbeRatio        = 0.10
 	obScoreHigh         = 4
 	obScoreLow          = -3
+	obEvictBottomN      = 20
+	obEvictMaxPerRound  = 2
+	obEvictInterval     = 30 * time.Second
+	obEvictMinPeers     = 15
+	obEvictBanDuration  = 15 * time.Minute
+	obEvictScoreLimit   = -3
 )
 
 var (
@@ -465,6 +471,8 @@ type Syncer struct {
 	peerDrop   *event.Feed         // Event feed to react to peers dropping
 	rates      *msgrate.Trackers   // Message throughput rates for peers
 	peerScores map[string]int      // Observation peer score by peer id
+	peerBan    map[string]time.Time
+	lastEvict  time.Time
 
 	// Request tracking during syncing phase
 	statelessPeers map[string]struct{} // Peers that failed to deliver state data
@@ -537,11 +545,12 @@ func NewSyncer(db ethdb.KeyValueStore, scheme string, observation bool) *Syncer 
 		archiveOnlyActive: observation,
 
 		peers:      make(map[string]SyncPeer),
-		peerJoin:   new(event.Feed),
-		peerDrop:   new(event.Feed),
-		rates:      msgrate.NewTrackers(log.New("proto", "snap")),
-		peerScores: make(map[string]int),
-		update:     make(chan struct{}, 1),
+			peerJoin:   new(event.Feed),
+			peerDrop:   new(event.Feed),
+			rates:      msgrate.NewTrackers(log.New("proto", "snap")),
+			peerScores: make(map[string]int),
+			peerBan:    make(map[string]time.Time),
+			update:     make(chan struct{}, 1),
 
 		accountIdlers:  make(map[string]struct{}),
 		storageIdlers:  make(map[string]struct{}),
@@ -581,6 +590,14 @@ func (s *Syncer) Register(peer SyncPeer) error {
 	id := peer.ID()
 
 	s.lock.Lock()
+	now := time.Now()
+	if until, ok := s.peerBan[id]; ok {
+		if now.Before(until) {
+			s.lock.Unlock()
+			return fmt.Errorf("peer %s is banned until %s", id, until.UTC().Format(time.RFC3339))
+		}
+		delete(s.peerBan, id)
+	}
 	if _, ok := s.peers[id]; ok {
 		log.Error("Snap peer already registered", "id", id)
 
@@ -1083,6 +1100,13 @@ func (s *Syncer) candidateCountLocked() int {
 }
 
 func (s *Syncer) allowObservationPeerLocked(id string, candidates int) bool {
+	now := time.Now()
+	if until, ok := s.peerBan[id]; ok {
+		if now.Before(until) {
+			return false
+		}
+		delete(s.peerBan, id)
+	}
 	if !s.observation || !s.archiveOnlyActive {
 		return true
 	}
@@ -1105,6 +1129,89 @@ func (s *Syncer) allowObservationPeerLocked(id string, candidates int) bool {
 		probe = gomath.Min(1.0, s.probeRatio*2)
 	}
 	return rand.Float64() < probe
+}
+
+func (s *Syncer) purgeExpiredBans(now time.Time) {
+	for id, until := range s.peerBan {
+		if !now.Before(until) {
+			delete(s.peerBan, id)
+		}
+	}
+}
+
+func (s *Syncer) PeerCount() int {
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+	return len(s.peers)
+}
+
+func (s *Syncer) ActiveBanCount(now time.Time) int {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	s.purgeExpiredBans(now)
+	return len(s.peerBan)
+}
+
+// EvictLowScorePeers selects low-score peers for disconnection in observation
+// archive-only mode and places them into a banlist.
+func (s *Syncer) EvictLowScorePeers(now time.Time) []string {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	if !s.observation || !s.archiveOnlyActive {
+		return nil
+	}
+	s.purgeExpiredBans(now)
+	connected := len(s.peers)
+	if connected <= obEvictMinPeers {
+		return nil
+	}
+	if !s.lastEvict.IsZero() && now.Sub(s.lastEvict) < obEvictInterval {
+		return nil
+	}
+	type scoredPeer struct {
+		id    string
+		score int
+	}
+	peers := make([]scoredPeer, 0, len(s.peers))
+	for id := range s.peers {
+		if until, ok := s.peerBan[id]; ok && now.Before(until) {
+			continue
+		}
+		peers = append(peers, scoredPeer{id: id, score: s.peerScores[id]})
+	}
+	if len(peers) == 0 {
+		return nil
+	}
+	sort.Slice(peers, func(i, j int) bool {
+		if peers[i].score == peers[j].score {
+			return peers[i].id < peers[j].id
+		}
+		return peers[i].score < peers[j].score
+	})
+	limit := obEvictBottomN
+	if len(peers) < limit {
+		limit = len(peers)
+	}
+	evicted := make([]string, 0, obEvictMaxPerRound)
+	for i := 0; i < limit; i++ {
+		if len(evicted) >= obEvictMaxPerRound {
+			break
+		}
+		if peers[i].score > obEvictScoreLimit {
+			continue
+		}
+		if connected-len(evicted) <= obEvictMinPeers {
+			break
+		}
+		id := peers[i].id
+		s.peerBan[id] = now.Add(obEvictBanDuration)
+		evicted = append(evicted, id)
+	}
+	if len(evicted) > 0 {
+		s.lastEvict = now
+	}
+	return evicted
 }
 
 func (s *Syncer) updatePeerScoreLocked(id string, delta int) {
