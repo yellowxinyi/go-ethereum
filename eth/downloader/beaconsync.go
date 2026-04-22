@@ -336,8 +336,6 @@ func (d *Downloader) fetchHeaders(from uint64) error {
 		}
 		d.pivotLock.Unlock()
 
-	schedule:
-
 		// Retrieve a batch of headers and feed it to the header processor
 	scheduleHeaders:
 		var (

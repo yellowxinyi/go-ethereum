@@ -1066,7 +1066,6 @@ func (d *Downloader) processSnapSyncContent() error {
 		// notifications from the header downloader
 		d.pivotLock.RLock()
 		pivot := d.pivotHeader
-		locked := d.pivotLocked
 		d.pivotLock.RUnlock()
 		if d.blockchain.ObservationMode() && d.observationStateSyncStuck() {
 			expected := common.Hash{}
