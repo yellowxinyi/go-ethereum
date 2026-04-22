@@ -166,6 +166,7 @@ type Downloader struct {
 	obNoProgressSince   time.Time
 	obLastStateProgress uint64
 	obArchiveOnlyActive atomic.Bool
+	obPivotStaleLogAt   time.Time
 
 	SnapSyncer     *snap.Syncer // TODO(karalabe): make private! hack for now
 	stateSyncStart chan *stateSync
