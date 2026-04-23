@@ -34,6 +34,7 @@ import (
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/filtermaps"
 	"github.com/ethereum/go-ethereum/core/history"
+	"github.com/ethereum/go-ethereum/core/nostatepool"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state/pruner"
 	"github.com/ethereum/go-ethereum/core/txpool"
@@ -94,6 +95,7 @@ type Ethereum struct {
 	// core protocol objects
 	config         *ethconfig.Config
 	txPool         *txpool.TxPool
+	noStateTxPool  *nostatepool.LegacyPool
 	blobTxPool     *blobpool.BlobPool
 	localTxTracker *locals.TxTracker
 	blockchain     *core.BlockChain
@@ -111,6 +113,7 @@ type Ethereum struct {
 
 	filterMaps      *filtermaps.FilterMaps
 	closeFilterMaps chan chan struct{}
+	closeNoStateTxPoolReset chan chan struct{}
 
 	APIBackend *EthAPIBackend
 
@@ -306,6 +309,7 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	}
 	eth.filterMaps = filterMaps
 	eth.closeFilterMaps = make(chan chan struct{})
+	eth.closeNoStateTxPoolReset = make(chan chan struct{})
 
 	// TxPool
 	if config.TxPool.Journal != "" {
@@ -320,6 +324,23 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 
 	eth.txPool, err = txpool.New(config.TxPool.PriceLimit, eth.blockchain, []txpool.SubPool{legacyPool, eth.blobTxPool})
 	if err != nil {
+		return nil, err
+	}
+	noStateCfg := nostatepool.Config{
+		Locals:       config.TxPool.Locals,
+		NoLocals:     config.TxPool.NoLocals,
+		Journal:      config.TxPool.Journal,
+		Rejournal:    config.TxPool.Rejournal,
+		PriceLimit:   config.TxPool.PriceLimit,
+		PriceBump:    config.TxPool.PriceBump,
+		AccountSlots: config.TxPool.AccountSlots,
+		GlobalSlots:  config.TxPool.GlobalSlots,
+		AccountQueue: config.TxPool.AccountQueue,
+		GlobalQueue:  config.TxPool.GlobalQueue,
+		Lifetime:     config.TxPool.Lifetime,
+	}
+	eth.noStateTxPool = nostatepool.New(noStateCfg, eth.blockchain)
+	if err := eth.noStateTxPool.Init(config.TxPool.PriceLimit, eth.blockchain.CurrentBlock(), nil); err != nil {
 		return nil, err
 	}
 
@@ -340,6 +361,7 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		Database:       chainDb,
 		Chain:          eth.blockchain,
 		TxPool:         eth.txPool,
+		NoStateTxPool:  eth.noStateTxPool,
 		Network:        networkID,
 		Sync:           config.SyncMode,
 		BloomCache:     uint64(cacheLimit),
@@ -424,9 +446,12 @@ func (s *Ethereum) ResetWithGenesisBlock(gb *types.Block) {
 
 func (s *Ethereum) Miner() *miner.Miner { return s.miner }
 
-func (s *Ethereum) AccountManager() *accounts.Manager  { return s.accountManager }
-func (s *Ethereum) BlockChain() *core.BlockChain       { return s.blockchain }
-func (s *Ethereum) TxPool() *txpool.TxPool             { return s.txPool }
+func (s *Ethereum) AccountManager() *accounts.Manager { return s.accountManager }
+func (s *Ethereum) BlockChain() *core.BlockChain      { return s.blockchain }
+func (s *Ethereum) TxPool() *txpool.TxPool            { return s.txPool }
+func (s *Ethereum) NoStateTxPool() *nostatepool.LegacyPool {
+	return s.noStateTxPool
+}
 func (s *Ethereum) BlobTxPool() *blobpool.BlobPool     { return s.blobTxPool }
 func (s *Ethereum) Engine() consensus.Engine           { return s.engine }
 func (s *Ethereum) ChainDb() ethdb.Database            { return s.chainDb }
@@ -465,6 +490,7 @@ func (s *Ethereum) Start() error {
 	// start log indexer
 	s.filterMaps.Start()
 	go s.updateFilterMapsHeads()
+	go s.updateNoStateTxPoolReset()
 	return nil
 }
 
@@ -525,6 +551,67 @@ func (s *Ethereum) updateFilterMapsHeads() {
 		case ch := <-s.closeFilterMaps:
 			close(ch)
 			return
+		}
+	}
+}
+
+func (s *Ethereum) updateNoStateTxPoolReset() {
+	if s.noStateTxPool == nil {
+		return
+	}
+	headEventCh := make(chan core.ChainHeadEvent, 10)
+	resetDoneCh := make(chan *types.Header, 1)
+	sub := s.blockchain.SubscribeChainHeadEvent(headEventCh)
+	defer func() {
+		sub.Unsubscribe()
+		for {
+			select {
+			case <-resetDoneCh:
+			case <-headEventCh:
+			default:
+				return
+			}
+		}
+	}()
+
+	headersEqual := func(a, b *types.Header) bool {
+		if a == nil || b == nil {
+			return a == b
+		}
+		return a.Hash() == b.Hash()
+	}
+	oldHead := s.blockchain.CurrentBlock()
+	newHead := oldHead
+	resetting := false
+	var closeWaiter chan struct{}
+	for {
+		if !resetting && closeWaiter == nil && !headersEqual(newHead, oldHead) {
+			resetting = true
+			previous, current := oldHead, newHead
+			go func() {
+				s.noStateTxPool.Reset(previous, current)
+				resetDoneCh <- current
+			}()
+		}
+		select {
+		case ev := <-headEventCh:
+			if closeWaiter != nil || ev.Header == nil {
+				continue
+			}
+			newHead = ev.Header
+		case head := <-resetDoneCh:
+			resetting = false
+			oldHead = head
+			if closeWaiter != nil {
+				close(closeWaiter)
+				return
+			}
+		case ch := <-s.closeNoStateTxPoolReset:
+			closeWaiter = ch
+			if !resetting {
+				close(ch)
+				return
+			}
 		}
 	}
 }
@@ -590,8 +677,12 @@ func (s *Ethereum) Stop() error {
 	ch := make(chan struct{})
 	s.closeFilterMaps <- ch
 	<-ch
+	ch2 := make(chan struct{})
+	s.closeNoStateTxPoolReset <- ch2
+	<-ch2
 	s.filterMaps.Stop()
 	s.txPool.Close()
+	s.noStateTxPool.Close()
 	s.blockchain.Stop()
 	s.engine.Close()
 

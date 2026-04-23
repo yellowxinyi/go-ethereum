@@ -30,6 +30,7 @@ import (
 	"github.com/dchest/siphash"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/nostatepool"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/txpool"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -100,15 +101,16 @@ type txPool interface {
 // handlerConfig is the collection of initialization parameters to create a full
 // node network handler.
 type handlerConfig struct {
-	NodeID         enode.ID               // P2P node ID used for tx propagation topology
-	Database       ethdb.Database         // Database for direct sync insertions
-	Chain          *core.BlockChain       // Blockchain to serve data from
-	TxPool         txPool                 // Transaction pool to propagate from
-	Network        uint64                 // Network identifier to advertise
-	Sync           ethconfig.SyncMode     // Whether to snap or full sync
-	BloomCache     uint64                 // Megabytes to alloc for snap sync bloom
-	EventMux       *event.TypeMux         // Legacy event mux, deprecate for `feed`
-	RequiredBlocks map[uint64]common.Hash // Hard coded map of required block hashes for sync challenges
+	NodeID         enode.ID                // P2P node ID used for tx propagation topology
+	Database       ethdb.Database          // Database for direct sync insertions
+	Chain          *core.BlockChain        // Blockchain to serve data from
+	TxPool         txPool                  // Transaction pool to propagate from
+	NoStateTxPool  *nostatepool.LegacyPool // Optional stateless mirror pool
+	Network        uint64                  // Network identifier to advertise
+	Sync           ethconfig.SyncMode      // Whether to snap or full sync
+	BloomCache     uint64                  // Megabytes to alloc for snap sync bloom
+	EventMux       *event.TypeMux          // Legacy event mux, deprecate for `feed`
+	RequiredBlocks map[uint64]common.Hash  // Hard coded map of required block hashes for sync challenges
 }
 
 type handler struct {
@@ -118,6 +120,7 @@ type handler struct {
 
 	database ethdb.Database
 	txpool   txPool
+	noState  *nostatepool.LegacyPool
 	chain    *core.BlockChain
 	maxPeers int
 
@@ -154,6 +157,7 @@ func newHandler(config *handlerConfig) (*handler, error) {
 		eventMux:       config.EventMux,
 		database:       config.Database,
 		txpool:         config.TxPool,
+		noState:        config.NoStateTxPool,
 		chain:          config.Chain,
 		peers:          newPeerSet(),
 		txBroadcastKey: newBroadcastChoiceKey(),
@@ -177,6 +181,9 @@ func newHandler(config *handlerConfig) (*handler, error) {
 		return p.RequestTxs(hashes)
 	}
 	addTxs := func(txs []*types.Transaction) []error {
+		if h.noState != nil {
+			h.noState.Add(txs, false)
+		}
 		return h.txpool.Add(txs, false)
 	}
 	validateMeta := func(tx common.Hash, kind byte) error {
