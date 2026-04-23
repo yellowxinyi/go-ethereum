@@ -235,6 +235,7 @@ type LegacyPool struct {
 	currentHead   atomic.Pointer[types.Header] // Current head of the blockchain
 	pendingNonces *noncer                      // Pending state tracking virtual nonces
 	reserver      txpool.Reserver              // Address reserver to ensure exclusivity across subpools
+	observer      *txpool.SnapshotObserver     // Optional async snapshot observer
 
 	pending map[common.Address]*list // All currently processable transactions
 	queue   *queue
@@ -394,9 +395,21 @@ func (pool *LegacyPool) Close() error {
 	// Terminate the pool reorger and return
 	close(pool.reorgShutdownCh)
 	pool.wg.Wait()
+	if pool.observer != nil {
+		if err := pool.observer.Close(); err != nil {
+			log.Warn("Failed to close nostatepool snapshot observer", "err", err)
+		}
+	}
 
 	log.Info("Transaction pool stopped")
 	return nil
+}
+
+// SetObserver installs an async snapshot observer for reset-time snapshots.
+func (pool *LegacyPool) SetObserver(observer *txpool.SnapshotObserver) {
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	pool.observer = observer
 }
 
 // Reset implements txpool.SubPool, allowing the legacy pool's internal state to be
@@ -1084,18 +1097,18 @@ func (pool *LegacyPool) removeTxWithNonceMode(hash common.Hash, outofbound bool,
 				pendingAddrsGauge.Dec(1)
 			}
 			// Postpone any invalidated transactions
-				for _, tx := range invalids {
-					// Internal shuffle shouldn't touch the lookup set.
-					pool.enqueueTx(tx.Hash(), tx, false)
-				}
-				// Update the account nonce if needed
-				if touchNonce {
-					pool.pendingNonces.setIfLower(addr, tx.Nonce())
-				}
-				// Reduce the pending counter
-				pendingGauge.Dec(int64(1 + len(invalids)))
-				return 1 + len(invalids)
+			for _, tx := range invalids {
+				// Internal shuffle shouldn't touch the lookup set.
+				pool.enqueueTx(tx.Hash(), tx, false)
 			}
+			// Update the account nonce if needed
+			if touchNonce {
+				pool.pendingNonces.setIfLower(addr, tx.Nonce())
+			}
+			// Reduce the pending counter
+			pendingGauge.Dec(int64(1 + len(invalids)))
+			return 1 + len(invalids)
+		}
 	}
 	// Transaction is in the future queue
 	pool.queue.remove(addr, tx)
@@ -1220,6 +1233,7 @@ func (pool *LegacyPool) runReorg(done chan struct{}, reset *txpoolResetRequest, 
 	}
 	pool.mu.Lock()
 	if reset != nil {
+		pool.observeSnapshotLocked(reset.newHead)
 		if reset.newHead != nil && reset.oldHead != nil {
 			// Discard the transactions with the gas limit higher than the cap.
 			if pool.chainconfig.IsOsaka(reset.newHead.Number, reset.newHead.Time) && !pool.chainconfig.IsOsaka(reset.oldHead.Number, reset.oldHead.Time) {
@@ -1295,6 +1309,21 @@ func (pool *LegacyPool) runReorg(done chan struct{}, reset *txpoolResetRequest, 
 		}
 		pool.txFeed.Send(core.NewTxsEvent{Txs: txs})
 	}
+}
+
+func (pool *LegacyPool) observeSnapshotLocked(head *types.Header) {
+	if pool.observer == nil || head == nil {
+		return
+	}
+	pending := make(map[common.Address][]*types.Transaction, len(pool.pending))
+	for addr, list := range pool.pending {
+		pending[addr] = list.Flatten()
+	}
+	pool.observer.Observe(&txpool.PoolSnapshot{
+		BlockNumber: head.Number.Uint64(),
+		Pending:     pending,
+		Queue:       pool.queue.content(),
+	})
 }
 
 // reset retrieves the current state of the blockchain and ensures the content

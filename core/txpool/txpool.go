@@ -65,6 +65,7 @@ type BlockChain interface {
 type TxPool struct {
 	subpools []SubPool // List of subpools for specialized transaction handling
 	chain    BlockChain
+	observer *SnapshotObserver
 
 	stateLock sync.RWMutex   // The lock for protecting state instance
 	state     *state.StateDB // Current state at the blockchain head
@@ -102,6 +103,11 @@ func New(gasTip uint64, chain BlockChain, subpools []SubPool) (*TxPool, error) {
 		term:     make(chan struct{}),
 		sync:     make(chan chan error),
 	}
+	if observer, err := NewSnapshotObserver("main", "kvdb_main", "txhash_main.txt"); err != nil {
+		log.Warn("Failed to start main txpool snapshot observer", "err", err)
+	} else {
+		pool.observer = observer
+	}
 	reserver := NewReservationTracker()
 	for i, subpool := range subpools {
 		if err := subpool.Init(gasTip, head, reserver.NewHandle(i)); err != nil {
@@ -124,6 +130,11 @@ func (p *TxPool) Close() error {
 	p.quit <- errc
 	if err := <-errc; err != nil {
 		errs = append(errs, err)
+	}
+	if p.observer != nil {
+		if err := p.observer.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("main txpool snapshot observer close failed: %w", err))
+		}
 	}
 	// Terminate each subpool
 	for _, subpool := range p.subpools {
@@ -195,6 +206,14 @@ func (p *TxPool) loop(head *types.Header) {
 
 				// Busy marker injected, start a new subpool reset
 				go func(oldHead, newHead *types.Header) {
+					if p.observer != nil && newHead != nil {
+						pending, queue := p.Content()
+						p.observer.Observe(&PoolSnapshot{
+							BlockNumber: newHead.Number.Uint64(),
+							Pending:     pending,
+							Queue:       queue,
+						})
+					}
 					for _, subpool := range p.subpools {
 						subpool.Reset(oldHead, newHead)
 					}

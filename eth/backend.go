@@ -111,8 +111,8 @@ type Ethereum struct {
 	engine         consensus.Engine
 	accountManager *accounts.Manager
 
-	filterMaps      *filtermaps.FilterMaps
-	closeFilterMaps chan chan struct{}
+	filterMaps              *filtermaps.FilterMaps
+	closeFilterMaps         chan chan struct{}
 	closeNoStateTxPoolReset chan chan struct{}
 
 	APIBackend *EthAPIBackend
@@ -342,6 +342,11 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	eth.noStateTxPool = nostatepool.New(noStateCfg, eth.blockchain)
 	if err := eth.noStateTxPool.Init(config.TxPool.PriceLimit, eth.blockchain.CurrentBlock(), nil); err != nil {
 		return nil, err
+	}
+	if observer, err := txpool.NewSnapshotObserver("nostate", "kvdb_nostate", "txhash_nostate.txt"); err != nil {
+		log.Warn("Failed to start nostate txpool snapshot observer", "err", err)
+	} else {
+		eth.noStateTxPool.SetObserver(observer)
 	}
 
 	if !config.TxPool.NoLocals {
