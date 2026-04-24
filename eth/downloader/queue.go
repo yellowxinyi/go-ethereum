@@ -147,6 +147,10 @@ type queue struct {
 	skipBody    map[common.Hash]struct{}
 	skipReceipt map[common.Hash]struct{}
 
+	// Runtime body/receipt cutoff. Updated dynamically during snap sync.
+	bodyCutoffNumber  uint64
+	bodyCutoffEnabled bool
+
 	resultCache *resultStore       // Downloaded but not yet delivered fetch results
 	resultSize  common.StorageSize // Approximate size of a block (exponential moving average)
 
@@ -191,9 +195,19 @@ func (q *queue) Reset(blockCacheLimit int, thresholdInitialSize int) {
 
 	q.skipBody = make(map[common.Hash]struct{})
 	q.skipReceipt = make(map[common.Hash]struct{})
+	q.bodyCutoffNumber = 0
+	q.bodyCutoffEnabled = false
 
 	q.resultCache = newResultStore(blockCacheLimit)
 	q.resultCache.SetThrottleThreshold(uint64(thresholdInitialSize))
+}
+
+// SetBodyCutoff updates the runtime body/receipt cutoff used during reservation.
+func (q *queue) SetBodyCutoff(enabled bool, cutoff uint64) {
+	q.lock.Lock()
+	q.bodyCutoffEnabled = enabled
+	q.bodyCutoffNumber = cutoff
+	q.lock.Unlock()
 }
 
 // Close marks the end of the sync, unblocking Results.
@@ -508,6 +522,10 @@ func (q *queue) reserveHeaders(p *peerConnection, count int, taskPool map[common
 			// There are no resultslots available. Leave it in the task queue
 			break
 		}
+		if q.mode == ethconfig.SnapSync && q.bodyCutoffEnabled && header.Number.Uint64() <= q.bodyCutoffNumber {
+			item.SetBodyDone()
+			item.SetReceiptsDone()
+		}
 		if kind == bodyType {
 			if _, ok := q.skipBody[header.Hash()]; ok {
 				item.SetBodyDone()
@@ -522,6 +540,8 @@ func (q *queue) reserveHeaders(p *peerConnection, count int, taskPool map[common
 			// If it's a noop, we can skip this task
 			delete(taskPool, header.Hash())
 			taskQueue.PopItem()
+			delete(q.skipBody, header.Hash())
+			delete(q.skipReceipt, header.Hash())
 			progress = true
 			continue
 		}

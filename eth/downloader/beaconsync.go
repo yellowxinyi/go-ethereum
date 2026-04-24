@@ -329,7 +329,13 @@ func (d *Downloader) fetchHeaders(from uint64) error {
 				rawdb.WriteLastPivotNumber(d.stateDB, d.pivotHeader.Number.Uint64())
 			}
 		}
+		pivot := d.pivotHeader
 		d.pivotLock.Unlock()
+
+		if d.getMode() == ethconfig.SnapSync {
+			enabled, cutoff := d.bodyCutoffForHead(head.Number.Uint64(), pivot)
+			d.advanceBodyCutoff(enabled, cutoff)
+		}
 
 		// Retrieve a batch of headers and feed it to the header processor
 		var (

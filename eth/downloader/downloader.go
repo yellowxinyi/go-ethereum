@@ -137,6 +137,7 @@ type Downloader struct {
 	// below this height are skipped, while headers and receipts are retained.
 	bodyCutoffNumber  uint64
 	bodyCutoffEnabled bool
+	bodyCutoffLock    sync.RWMutex
 
 	// Channels
 	headerProcCh chan *headerTask // Channel to feed the header processor new tasks
@@ -586,16 +587,10 @@ func (d *Downloader) syncToHead() (err error) {
 	}
 	// Configure the snap-body cutoff for the ultra-light observation mode.
 	if mode == ethconfig.SnapSync {
-		if height >= snapBodyKeepBlocks {
-			d.bodyCutoffNumber = height - snapBodyKeepBlocks
-			d.bodyCutoffEnabled = true
-		} else {
-			d.bodyCutoffNumber = 0
-			d.bodyCutoffEnabled = false
-		}
+		enabled, cutoff := d.bodyCutoffForHead(height, pivot)
+		d.initBodyCutoff(enabled, cutoff)
 	} else {
-		d.bodyCutoffNumber = 0
-		d.bodyCutoffEnabled = false
+		d.initBodyCutoff(false, 0)
 	}
 	// Keep the result cache aligned with the earliest header to process.
 	chainOffset := origin + 1
@@ -648,6 +643,59 @@ func (d *Downloader) spawnSync(fetchers []func() error) error {
 	d.queue.Close()
 	d.Cancel()
 	return err
+}
+
+// bodyCutoffForHead calculates the effective body/receipt cutoff for a given
+// head. While the pivot is not committed, the cutoff is clamped to pivot-1.
+func (d *Downloader) bodyCutoffForHead(head uint64, pivot *types.Header) (bool, uint64) {
+	if head < snapBodyKeepBlocks {
+		return false, 0
+	}
+	cutoff := head - snapBodyKeepBlocks
+	if !d.committed.Load() && pivot != nil {
+		pivotNum := pivot.Number.Uint64()
+		if pivotNum > 0 {
+			guard := pivotNum - 1
+			if cutoff > guard {
+				cutoff = guard
+			}
+		}
+	}
+	return true, cutoff
+}
+
+// initBodyCutoff sets the body cutoff for the start of a sync round.
+func (d *Downloader) initBodyCutoff(enabled bool, cutoff uint64) {
+	d.bodyCutoffLock.Lock()
+	d.bodyCutoffEnabled = enabled
+	d.bodyCutoffNumber = cutoff
+	d.bodyCutoffLock.Unlock()
+
+	d.queue.SetBodyCutoff(enabled, cutoff)
+}
+
+// advanceBodyCutoff moves the body cutoff forward. It does not move backwards.
+func (d *Downloader) advanceBodyCutoff(enabled bool, cutoff uint64) {
+	if !enabled {
+		return
+	}
+	d.bodyCutoffLock.Lock()
+	if d.bodyCutoffEnabled && cutoff <= d.bodyCutoffNumber {
+		d.bodyCutoffLock.Unlock()
+		return
+	}
+	d.bodyCutoffEnabled = true
+	d.bodyCutoffNumber = cutoff
+	d.bodyCutoffLock.Unlock()
+
+	d.queue.SetBodyCutoff(true, cutoff)
+}
+
+func (d *Downloader) snapshotBodyCutoff() (bool, uint64) {
+	d.bodyCutoffLock.RLock()
+	defer d.bodyCutoffLock.RUnlock()
+
+	return d.bodyCutoffEnabled, d.bodyCutoffNumber
 }
 
 // cancel aborts all of the operations and resets the queue. However, cancel does
@@ -800,7 +848,8 @@ func (d *Downloader) processHeaders(origin uint64) error {
 				}
 				if len(scheduleHeaders) > 0 {
 					scheduled = true
-					if d.queue.ScheduleWithBodyCutoff(scheduleHeaders, scheduleHashes, scheduleOrigin, d.bodyCutoffEnabled, d.bodyCutoffNumber) != len(scheduleHeaders) {
+					cutoffEnabled, cutoffNumber := d.snapshotBodyCutoff()
+					if d.queue.ScheduleWithBodyCutoff(scheduleHeaders, scheduleHashes, scheduleOrigin, cutoffEnabled, cutoffNumber) != len(scheduleHeaders) {
 						return fmt.Errorf("%w: stale headers", errBadPeer)
 					}
 				}
