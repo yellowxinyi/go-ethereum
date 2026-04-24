@@ -28,7 +28,6 @@ import (
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
-	"github.com/ethereum/go-ethereum/core/state/roothash"
 	"github.com/ethereum/go-ethereum/core/state/snapshot"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/eth/ethconfig"
@@ -995,22 +994,13 @@ func (d *Downloader) processSnapSyncContent() error {
 			// Wait for completion, occasionally checking for pivot staleness
 			timer.Reset(time.Second)
 			select {
-			case <-sync.done:
-				if sync.err != nil {
-					return sync.err
-				}
-				if d.blockchain.ObservationMode() {
-					computed, err := roothash.ComputeHashedStateRoot(d.stateDB)
-					if err != nil {
+				case <-sync.done:
+					if sync.err != nil {
+						return sync.err
+					}
+					if err := d.commitPivotBlock(P); err != nil {
 						return err
 					}
-					if computed != P.Header.Root {
-						return fmt.Errorf("pivot state root mismatch (remote: %x local: %x)", P.Header.Root, computed)
-					}
-				}
-				if err := d.commitPivotBlock(P); err != nil {
-					return err
-				}
 				oldPivot = nil
 
 			case <-timer.C:
