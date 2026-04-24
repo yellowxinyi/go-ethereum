@@ -210,6 +210,10 @@ type BlockChain interface {
 	// SnapSyncComplete directly commits the head block to a certain entity.
 	SnapSyncComplete(common.Hash) error
 
+	// SnapSyncAbort resets transient chain switches if snap sync exits before
+	// pivot commit.
+	SnapSyncAbort() error
+
 	// InsertHeadersBeforeCutoff inserts a batch of headers before the configured
 	// chain cutoff into the ancient store.
 	InsertHeadersBeforeCutoff([]*types.Header) (int, error)
@@ -381,10 +385,18 @@ func (d *Downloader) synchronise(beaconPing chan struct{}) (err error) {
 
 	// Obtain the synchronized used in this cycle
 	mode := d.moder.get(true)
+	var snapSyncStarted bool
 	defer func() {
 		if err == nil && mode == ethconfig.SnapSync {
 			d.moder.disableSnap()
 			log.Info("Disabled snap-sync after the initial sync cycle")
+		}
+	}()
+	defer func() {
+		if mode == ethconfig.SnapSync && snapSyncStarted && !d.committed.Load() {
+			if abortErr := d.blockchain.SnapSyncAbort(); abortErr != nil {
+				log.Warn("Failed to abort snap-sync chain switches", "err", abortErr)
+			}
 		}
 	}()
 
@@ -394,6 +406,7 @@ func (d *Downloader) synchronise(beaconPing chan struct{}) (err error) {
 		if err := d.blockchain.SnapSyncStart(); err != nil {
 			return err
 		}
+		snapSyncStarted = true
 	}
 	// Reset the queue, peer set and wake channels to clean any internal leftover state
 	d.queue.Reset(blockCacheMaxItems, blockCacheInitialItems)

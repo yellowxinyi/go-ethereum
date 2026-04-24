@@ -348,6 +348,7 @@ type BlockChain struct {
 	genesisBlock     *types.Block
 	blockPebbleChan  chan *types.Block
 	blockPebbleQuit  chan struct{}
+	blockRLPDumpEnabled atomic.Bool
 
 	// This mutex synchronizes chain write operations.
 	// Readers don't need to take it, they can just read the database.
@@ -440,6 +441,7 @@ func NewBlockChain(db ethdb.Database, genesis *Genesis, engine consensus.Engine,
 	if err != nil {
 		return nil, err
 	}
+	bc.blockRLPDumpEnabled.Store(true)
 	bc.flushInterval.Store(int64(cfg.TrieTimeLimit))
 	bc.statedb = state.NewDatabase(bc.triedb, bc.codedb)
 	if bc.cfg.ObservationMode {
@@ -1196,6 +1198,9 @@ func (bc *BlockChain) SnapSyncStart() error {
 	if snapshots := bc.Snapshots(); snapshots != nil { // Only nil in tests
 		snapshots.Disable()
 	}
+	// Skip block RLP dumping during snap sync, only re-enable once execution
+	// stage starts or the cycle aborts.
+	bc.blockRLPDumpEnabled.Store(false)
 	return nil
 }
 
@@ -1233,8 +1238,16 @@ func (bc *BlockChain) SnapSyncComplete(hash common.Hash) error {
 	// If all checks out, manually set the head block.
 	bc.currentBlock.Store(block.Header())
 	headBlockGauge.Update(int64(block.NumberU64()))
+	bc.blockRLPDumpEnabled.Store(true)
 
 	log.Info("Committed new head block", "number", block.Number(), "hash", hash)
+	return nil
+}
+
+// SnapSyncAbort resets transient snap-sync switches when a cycle exits before
+// pivot commit.
+func (bc *BlockChain) SnapSyncAbort() error {
+	bc.blockRLPDumpEnabled.Store(true)
 	return nil
 }
 
@@ -1334,10 +1347,12 @@ func (bc *BlockChain) writeHeadBlock(block *types.Block) {
 	if err := batch.Write(); err != nil {
 		log.Crit("Failed to update chain indexes and markers", "err", err)
 	}
-	select {
-	case bc.blockPebbleChan <- block:
-	default:
-		panic(fmt.Errorf("blockkv channel full"))
+	if bc.blockRLPDumpEnabled.Load() {
+		select {
+		case bc.blockPebbleChan <- block:
+		default:
+			panic(fmt.Errorf("blockkv channel full"))
+		}
 	}
 	// Update all in-memory chain markers in the last step
 	bc.hc.SetCurrentHeader(block.Header())
