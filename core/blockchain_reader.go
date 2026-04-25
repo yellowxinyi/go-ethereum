@@ -386,6 +386,9 @@ func (bc *BlockChain) TxIndexDone() bool {
 
 // HasState checks if state trie is fully present in the database or not.
 func (bc *BlockChain) HasState(hash common.Hash) bool {
+	if bc.cfg.ObservationMode {
+		return true
+	}
 	_, err := bc.triedb.NodeReader(hash)
 	return err == nil
 }

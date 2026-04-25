@@ -323,6 +323,19 @@ func (db *Database) Enable(root common.Hash) error {
 	return pdb.Enable(root)
 }
 
+// EnableWithoutRootCheck activates database and resets the state tree with the
+// provided persistent state root once the state sync is finished, without
+// verifying the stored trie root.
+//
+// It's only supported by path-based database and will return an error for others.
+func (db *Database) EnableWithoutRootCheck(root common.Hash) error {
+	pdb, ok := db.backend.(*pathdb.Database)
+	if !ok {
+		return errors.New("not supported")
+	}
+	return pdb.EnableWithoutRootCheck(root)
+}
+
 // Journal commits an entire diff hierarchy to disk into a single journal entry.
 // This is meant to be used during shutdown to persist the snapshot without
 // flattening everything down (bad for reorgs). It's only supported by path-based

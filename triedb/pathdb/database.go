@@ -372,6 +372,19 @@ func (db *Database) Disable() error {
 // Enable activates database and resets the state tree with the provided persistent
 // state root once the state sync is finished.
 func (db *Database) Enable(root common.Hash) error {
+	return db.enable(root, true)
+}
+
+// EnableWithoutRootCheck activates database and resets the state tree with the
+// provided persistent state root once the state sync is finished, without
+// verifying the stored trie root.
+//
+// This method is intended for ultra-light observation mode only.
+func (db *Database) EnableWithoutRootCheck(root common.Hash) error {
+	return db.enable(root, false)
+}
+
+func (db *Database) enable(root common.Hash, checkRoot bool) error {
 	db.lock.Lock()
 	defer db.lock.Unlock()
 
@@ -380,12 +393,14 @@ func (db *Database) Enable(root common.Hash) error {
 		return errDatabaseReadOnly
 	}
 	// Ensure the provided state root matches the stored one.
-	stored, err := db.hasher(rawdb.ReadAccountTrieNode(db.diskdb, nil))
-	if err != nil {
-		return err
-	}
-	if stored != root {
-		return fmt.Errorf("state root mismatch: stored %x, synced %x", stored, root)
+	if checkRoot {
+		stored, err := db.hasher(rawdb.ReadAccountTrieNode(db.diskdb, nil))
+		if err != nil {
+			return err
+		}
+		if stored != root {
+			return fmt.Errorf("state root mismatch: stored %x, synced %x", stored, root)
+		}
 	}
 	// Drop the stale state journal in persistent database and
 	// reset the persistent state id back to zero.

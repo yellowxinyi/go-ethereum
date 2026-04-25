@@ -1187,7 +1187,9 @@ func (bc *BlockChain) SnapSyncStart() error {
 	// trie database unusable until the state is fully synced. To prevent any
 	// subsequent state reads, explicitly disable the trie database and state
 	// syncer is responsible to address and correct any state missing.
-	if bc.TrieDB().Scheme() == rawdb.PathScheme {
+	// Observation mode does not maintain MPT data. Skip pathdb disable to avoid
+	// entering a waitSync state that cannot be completed by snap sync.
+	if !bc.cfg.ObservationMode && bc.TrieDB().Scheme() == rawdb.PathScheme {
 		if err := bc.TrieDB().Disable(); err != nil {
 			return err
 		}
@@ -1222,12 +1224,20 @@ func (bc *BlockChain) SnapSyncComplete(hash common.Hash) error {
 	// Reset the trie database with the fresh snap synced state.
 	root := block.Root()
 	if bc.triedb.Scheme() == rawdb.PathScheme {
-		if err := bc.triedb.Enable(root); err != nil {
-			return err
+		if bc.cfg.ObservationMode {
+			if err := bc.triedb.EnableWithoutRootCheck(root); err != nil {
+				return err
+			}
+		} else {
+			if err := bc.triedb.Enable(root); err != nil {
+				return err
+			}
 		}
 	}
-	if !bc.HasState(root) {
-		return fmt.Errorf("non existent state [%x..]", root[:4])
+	if !bc.cfg.ObservationMode {
+		if !bc.HasState(root) {
+			return fmt.Errorf("non existent state [%x..]", root[:4])
+		}
 	}
 	// Destroy any existing state snapshot and regenerate it in the background,
 	// also resuming the normal maintenance of any previously paused snapshot.
