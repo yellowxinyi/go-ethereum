@@ -1214,6 +1214,11 @@ func (bc *BlockChain) SnapSyncComplete(hash common.Hash) error {
 	// Make sure that both the block as well at its state trie exists
 	block := bc.GetBlockByHash(hash)
 	if block == nil {
+		if bc.cfg.ObservationMode {
+			log.Warn("Observation mode: missing snap pivot block, skipping head commit", "hash", hash)
+			bc.blockRLPDumpEnabled.Store(true)
+			return nil
+		}
 		return fmt.Errorf("non existent block [%x..]", hash[:4])
 	}
 	if !bc.chainmu.TryLock() {

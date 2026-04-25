@@ -871,6 +871,13 @@ func (api *ConsensusAPI) newPayload(ctx context.Context, params engine.Executabl
 	processingTime := time.Since(start)
 	if err != nil {
 		log.Warn("NewPayload: inserting block failed", "error", err)
+		if api.eth.BlockChain().ObservationMode() {
+			// Observation mode prefers liveness over execution validity.
+			// Keep the payload available for potential forkchoice-driven progress
+			// and avoid returning INVALID to the beacon client.
+			api.remoteBlocks.put(block.Hash(), block.Header())
+			return engine.PayloadStatusV1{Status: engine.ACCEPTED}, nil
+		}
 
 		api.invalidLock.Lock()
 		api.invalidBlocksHits[block.Hash()] = 1

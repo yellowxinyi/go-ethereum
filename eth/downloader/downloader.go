@@ -930,6 +930,21 @@ func (d *Downloader) importBlockResults(results []*fetchResult) error {
 	// transition. Because the downloaded chain is guided by the
 	// consensus-layer.
 	if index, err := d.blockchain.InsertChain(blocks); err != nil {
+		if d.blockchain.ObservationMode() {
+			// Observation mode never blocks on execution validity. If execution
+			// fails (nonce/gas/state drift, etc.), fall back to receipt-only
+			// insertion and keep progressing with beacon-driven backfill.
+			log.Warn("Observation mode: block execution failed, trying receipt-only import", "err", err, "index", index, "items", len(results))
+
+			receipts := make([]rlp.RawValue, len(results))
+			for i, result := range results {
+				receipts[i] = result.Receipts
+			}
+			if _, recErr := d.blockchain.InsertReceiptChain(blocks, receipts, d.ancientLimit); recErr != nil {
+				log.Error("Observation mode: receipt-only import failed, skipping batch", "err", recErr, "items", len(results))
+			}
+			return nil
+		}
 		if index < len(results) {
 			log.Debug("Downloaded item processing failed", "number", results[index].Header.Number, "hash", results[index].Header.Hash(), "err", err)
 
